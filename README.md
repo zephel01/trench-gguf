@@ -182,6 +182,43 @@ Only shard 2 (layers 0-3) is written again (about 49 GB); the other shards are h
 | `gpuq_init failed` | the GPU is not visible: `rocminfo` or `nvidia-smi` should list it; run `./setup.sh` again |
 | `MISMATCH` in `setup.sh`'s self-test | do not use `--gpu`; open an issue with `setup-test.log` |
 
+## 🧩 Supported models
+
+trench-gguf re-quantizes the **routed experts of MoE models**: the 3-D `ffn_gate_exps` / `ffn_up_exps` /
+`ffn_down_exps` tensors (or a fused `ffn_gate_up_exps`) that llama.cpp's MoE GGUFs use. The source can be any type
+ggml reads (BF16, Q8_0, MXFP4, k-quants, i-quants). Checked 2026-10-29 on the GGUFs at hand (headers of ~300 files,
+plus the runs below):
+
+| Model (llama.cpp arch) | Experts (row length ne0) | unsloth imatrix | Checked | Status |
+| --- | --- | --- | --- | --- |
+| DeepSeek V4.1 Flash 1017 (`deepseek41`) | gate/up 5120, down 2304, 384 experts | yes | full run, 15.5 min | ◎ |
+| Qwen3.8-Flash-Next (`qwen4exp`) | gate/up 2560, **down 640**, 512 experts | yes | full run (119.5 → 40.4 GiB), loads and answers in llama.cpp; GPU match 100% | ◎ (down → IQ4_NL) |
+| GLM-5.3-Flash (`glm5-next`) | gate/up 4096, down 2048, 288 experts | yes | `--check`, GPU match 100% | ○ |
+| Ornith-1.5-122B, Qwen3.5-122B (`qwen35moe`) | gate/up 3072, down 1024, 256 experts | own | `--check`, GPU match 100% | ○ |
+| DeepSeek V4 Flash 0731 (`deepseek4`) | gate/up 4096, down 2048, 256 experts | **no** | headers | ○ (needs an imatrix) |
+| MiniMax M3.1 Flash (`minimax-m3`) | gate/up 6144, down 3072, 128 experts | — | headers | ○ |
+| 35B-A3B family (`qwen35moe`: Ornith-1.0/1.5-35B, Qwen-AgentWorld, Holo4, Tiel-Coder, ...), Laguna-S-2.1 | all multiples of 256 | — | headers | ○ |
+| Qwen3 MoE (`qwen3moe`: llm-jp-4.1-32b-a3b, ...) | gate/up 2048, **down 768 / 960** | — | headers | △ (down → IQ4_NL) |
+| Gemma 4 26B-A4B (`gemma4`) | fused gate_up 2816, **down 704** | — | headers | △ (down → IQ4_NL; write a rule for `ffn_gate_up_exps`) |
+
+◎ run end to end, ○ shapes fit (and `--check` / the GPU match where listed), △ partly: some tensors fall back.
+
+**Why some tensors cannot take the asked type**
+
+| Case | Example | Cause | What trench-gguf does |
+| --- | --- | --- | --- |
+| Row length not a multiple of 256 | Qwen3.8 down (640), Qwen3 MoE down (768 / 960), Gemma 4 down (704) | IQ1_\*/IQ2_\*/IQ3_\* and the k-quants pack 256 weights a block; a row that 256 does not divide cannot be stored. A limit of the formats, not of the tool | llama-quantize's fallback: IQ1_\*/IQ2_\*/IQ3_\*/IQ4_XS → IQ4_NL, Q2_K/Q3_K → Q4_0, Q4_K → Q5_0, Q5_K → Q5_1, Q6_K → Q8_0 (F16 if even that does not fit). unsloth's and ISTA's Qwen3.8 GGUFs use IQ4_NL there too |
+| No imatrix data for the tensor | the NextN/MTP layer: Ornith-1.5 `blk.48`, GLM-5.3-Flash `blk.45` | the calibration run never reached that layer. IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S need an imatrix (llama-quantize stops: "the result will be garbage") | left as is; give it a rule of its own with a type that does not need one, e.g. `blk\.48\.ffn_\w+_exps\.weight  iq4_xs` above the others |
+| Fused gate and up | Gemma 4 `ffn_gate_up_exps` | one tensor instead of two | works, but the rule must name `ffn_gate_up_exps` |
+
+**Not supported**
+
+| Case | Example | Cause |
+| --- | --- | --- |
+| Dense models | Qwen3.8-27B, Gemma 4 12B / 31B, MiniCPM5 | no expert tensors; trench-gguf only rewrites MoE experts (dense support is on the roadmap) |
+| Fork-only tensor types | ROCmFP4 builds (type 101), Ternary Bonsai PQ2_0 / PTQ1_0 (types 142 / 143) | not in upstream llama.cpp; gguf-py cannot read the header and ggml cannot turn them back into floats |
+| No imatrix for the model | DeepSeek V4 Flash 0731 (unsloth publishes none) | the very low-bit types need one; make it with `llama-imatrix` (or take one from the model's publisher) |
+
 ## 🛠️ Usage
 
 ### Re-quantize a model's experts
@@ -251,13 +288,16 @@ About half of the GPU's time is the float weights crossing PCIe.
 
 ## ⚠️ Limits
 
-- **Types**: IQ2_XXS, IQ2_S, IQ1_S, IQ1_M. IQ2_XS and IQ3_XXS are next; other types run on the CPU.
+- **Types**: IQ2_XXS, IQ2_S, IQ1_S, IQ1_M on the GPU. IQ2_XS and IQ3_XXS are next; other types (and the IQ4_NL
+  fallback) run on the CPU through ggml.
+- **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
 - **CUDA**: builds, but the match has not been checked on an NVIDIA GPU yet.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;
   on Windows, MSVC's `qsort` may order ties differently. The self-test tells.
 - **llama.cpp version**: ported from bed0a8566 and re-checked on ac8e1694d. Older llama.cpp searches IQ1_M another
   way. After an update, run the self-test.
-- **An imatrix is required** (as in llama.cpp for these types).
+- **An imatrix is required** (as in llama.cpp for the IQ1/IQ2 types). A tensor the imatrix has no data for is quantized
+  without one when its type allows it, and left as is for the IQ1/IQ2 types.
 
 ## 🗺️ Roadmap
 

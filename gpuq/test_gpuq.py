@@ -57,7 +57,10 @@ def main():
     else:
         imat = read_imatrix(imat_path)
         r = gguf.GGUFReader(shard)
-        t = next(t for t in r.tensors if pat.search(t.name) and len(t.shape) == 3)
+        t = next((t for t in r.tensors if pat.search(t.name) and len(t.shape) == 3), None)
+        if t is None:
+            sys.exit("no 3-D expert tensor matching --tensor in %s (a split model keeps its experts in some shards only:\n"
+                     "pass a shard that holds them)" % shard)
         ne0, ne1, ne2 = (int(x) for x in t.shape)
         print("%s %s [%d x %d x %d], %d experts" % (t.name, t.tensor_type.name, ne0, ne1, ne2, n_exp))
         to_float = TO_FLOAT(lib.ggml_get_type_traits(int(t.tensor_type)).contents.to_float)

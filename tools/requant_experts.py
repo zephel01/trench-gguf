@@ -12,6 +12,12 @@ skipped, and one gguf-py cannot read (DeepSeek V4.1's Engram-only shard) is copi
 expert's imatrix row (llama-quantize's normalization: in_sum2 / counts, 1 for an expert the calibration never routed
 to).  The source's rounding error and the new one add up: start from the most precise file to hand.
 
+Rows that the asked type cannot hold (ne0 not a multiple of its block, e.g. Qwen3.8's 640-long down rows) get
+llama-quantize's fallback type (IQ1_*/IQ2_*/IQ3_*/IQ4_XS -> IQ4_NL, Q2_K/Q3_K -> Q4_0, Q4_K -> Q5_0, Q5_K -> Q5_1,
+Q6_K -> Q8_0, F16 when even that does not fit).  A tensor the imatrix has no data for (e.g. Ornith's NextN layer) is
+quantized without one when the type allows it; the very low-bit types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S) need it,
+as in llama-quantize, so such a tensor is left as is - give it a rule of its own with another type (iq4_xs, q4_k ...).
+
 --gpu quantizes IQ2_XXS / IQ2_S / IQ1_S / IQ1_M on the GPU with gpuq/libgpuq.so (ggml's quantizers line for line:
 byte-identical output, checked by gpuq/test_gpuq.py); the dequantizing stays on the CPU threads, other types stay on
 the CPU.  GPUQ_LIB picks the library (libgpuq_cuda.so for CUDA), GPUQ_DIR its folder.
@@ -54,6 +60,20 @@ def read_rules(path):
             pat, typ = line.rsplit(None, 1)
             rules.append((re.compile(pat), Q[typ.upper()]))
     return rules
+
+
+FALLBACK = {Q.IQ1_S: Q.IQ4_NL, Q.IQ1_M: Q.IQ4_NL, Q.IQ2_XXS: Q.IQ4_NL, Q.IQ2_XS: Q.IQ4_NL, Q.IQ2_S: Q.IQ4_NL,
+            Q.IQ3_XXS: Q.IQ4_NL, Q.IQ3_S: Q.IQ4_NL, Q.IQ4_XS: Q.IQ4_NL, Q.Q2_K: Q.Q4_0, Q.Q3_K: Q.Q4_0,
+            Q.Q4_K: Q.Q5_0, Q.Q5_K: Q.Q5_1, Q.Q6_K: Q.Q8_0}   # (llama-quantize's tensor_type_fallback)
+NEEDS_IMATRIX = {Q.IQ1_S, Q.IQ1_M, Q.IQ2_XXS, Q.IQ2_XS, Q.IQ2_S}
+
+
+def fit_type(typ, ne0):
+    """The type llama-quantize would write for rows of length ne0 when asked for typ."""
+    if ne0 % gguf.GGML_QUANT_SIZES[typ][0] == 0:
+        return typ
+    fb = FALLBACK.get(typ, typ)
+    return fb if ne0 % gguf.GGML_QUANT_SIZES[fb][0] == 0 else Q.F16
 
 
 def read_imatrix(path):
@@ -140,21 +160,30 @@ def main() -> int:
         plan = []
         for t in r.tensors:
             new_type = next((typ for pat, typ in rules if pat.search(t.name)), None)
-            if new_type is not None and (len(t.shape) != 3 or t.name not in imat):
-                print("  %s: not a 3-D expert tensor with imatrix data: left as is" % t.name)
+            if new_type is not None and len(t.shape) != 3:
+                print("  %s: not a 3-D expert tensor: left as is" % t.name)
                 new_type = None
+            if new_type is not None:
+                ne0, ne1, ne2 = (int(x) for x in t.shape)
+                fit = fit_type(new_type, ne0)
+                if fit != new_type:
+                    print("  %s: rows of %d do not fit %s: %s instead (llama-quantize's fallback)" % (
+                        t.name, ne0, new_type.name, fit.name))
+                    new_type = fit
+                if t.name not in imat and new_type in NEEDS_IMATRIX:
+                    print("  %s: no imatrix data, which %s needs: left as is (give it a rule with another type)" % (
+                        t.name, new_type.name))
+                    new_type = None
+                elif t.name in imat and imat[t.name].shape != (ne2, ne0):
+                    print("  %s: imatrix %s does not fit [%d x %d experts]: left as is" % (
+                        t.name, imat[t.name].shape, ne0, ne2))
+                    new_type = None
             if new_type is not None and new_type == t.tensor_type:
                 new_type = None
             if new_type is None:
                 plan.append((t, None, 0))
                 continue
-            ne0, ne1, ne2 = (int(x) for x in t.shape)
             bs, ts = gguf.GGML_QUANT_SIZES[new_type]
-            if ne0 % bs != 0 or imat[t.name].shape != (ne2, ne0):
-                print("  %s: ne0 %d / imatrix %s do not fit %s: left as is" % (t.name, ne0, imat[t.name].shape,
-                                                                              new_type.name))
-                plan.append((t, None, 0))
-                continue
             nbytes = ne2 * ne1 * (ne0 // bs) * ts
             plan.append((t, new_type, nbytes))
             total_old += t.n_bytes
@@ -195,7 +224,7 @@ def main() -> int:
             raw = np.ascontiguousarray(np.asarray(t.data).reshape(ne2, -1))
             per = nbytes // ne2
             dst = np.empty((ne2, per), dtype=np.uint8)
-            im = imat[t.name]
+            im = imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
 
             on_gpu = gq is not None and gq.gpuq_block_bytes(int(new_type)) > 0
 
@@ -205,9 +234,9 @@ def main() -> int:
                 if on_gpu:
                     with gq_lock:
                         return gq.gpuq_quantize(int(new_type), f32.ctypes.data, dst[e].ctypes.data, ne1, ne0,
-                                                im[e].ctypes.data)
+                                                im[e].ctypes.data)   # (the GPU types all have an imatrix here)
                 got = lib.ggml_quantize_chunk(int(new_type), f32.ctypes.data, dst[e].ctypes.data, 0, ne1, ne0,
-                                              im[e].ctypes.data)
+                                              None if im is None else im[e].ctypes.data)
                 return got
 
             with concurrent.futures.ThreadPoolExecutor(threads) as ex:

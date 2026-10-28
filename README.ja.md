@@ -199,6 +199,40 @@ ls -lh mix
 | `gpuq_init failed` | GPU が見えていない。`rocminfo` か `nvidia-smi` に GPU が出るか確かめ、`./setup.sh` をもう一度流す |
 | `setup.sh` の自己テストで `MISMATCH` | `--gpu` を使わない。`setup-test.log` を付けて issue を立てる |
 
+## 🧩 対応するモデル
+
+trench-gguf が量子化し直すのは、**MoE モデルのエキスパート**です。llama.cpp の MoE の GGUF にある、3 次元の `ffn_gate_exps` / `ffn_up_exps` / `ffn_down_exps`（または、まとまった `ffn_gate_up_exps`）が対象です。元の型は、ggml が読めるものなら何でも構いません（BF16、Q8_0、MXFP4、k-quant、i-quant）。2026-10-29 に、手元の GGUF（約 300 ファイルの見出しと、下の実行）で確かめました。
+
+| モデル（llama.cpp のアーキテクチャ） | エキスパート（行の長さ ne0） | unsloth の imatrix | 確かめたこと | 状態 |
+| --- | --- | --- | --- | --- |
+| DeepSeek V4.1 Flash 1017（`deepseek41`） | gate/up 5120、down 2304、384 個 | あり | 通しで実行、15 分半 | ◎ |
+| Qwen3.8-Flash-Next（`qwen4exp`） | gate/up 2560、**down 640**、512 個 | あり | 通しで実行（119.5 → 40.4 GiB）、llama.cpp で読み込んで答えることを確認、GPU の一致 100% | ◎（down は IQ4_NL） |
+| GLM-5.3-Flash（`glm5-next`） | gate/up 4096、down 2048、288 個 | あり | `--check`、GPU の一致 100% | ○ |
+| Ornith-1.5-122B、Qwen3.5-122B（`qwen35moe`） | gate/up 3072、down 1024、256 個 | 自作 | `--check`、GPU の一致 100% | ○ |
+| DeepSeek V4 Flash 0731（`deepseek4`） | gate/up 4096、down 2048、256 個 | **なし** | 見出し | ○（imatrix が必要） |
+| MiniMax M3.1 Flash（`minimax-m3`） | gate/up 6144、down 3072、128 個 | — | 見出し | ○ |
+| 35B-A3B 系（`qwen35moe`：Ornith-1.0/1.5-35B、Qwen-AgentWorld、Holo4、Tiel-Coder など）、Laguna-S-2.1 | すべて 256 の倍数 | — | 見出し | ○ |
+| Qwen3 MoE（`qwen3moe`：llm-jp-4.1-32b-a3b など） | gate/up 2048、**down 768 / 960** | — | 見出し | △（down は IQ4_NL） |
+| Gemma 4 26B-A4B（`gemma4`） | まとまった gate_up 2816、**down 704** | — | 見出し | △（down は IQ4_NL。`ffn_gate_up_exps` の規則を書く） |
+
+◎ 通しで実行済み、○ 形が合う（表にあるものは `--check` と GPU の一致も確認）、△ 一部のテンソルは代わりの型になる。
+
+**一部のテンソルが指定の型にならない理由**
+
+| 場合 | 例 | 原因 | trench-gguf の動き |
+| --- | --- | --- | --- |
+| 行の長さが 256 の倍数でない | Qwen3.8 の down（640）、Qwen3 MoE の down（768 / 960）、Gemma 4 の down（704） | IQ1/IQ2/IQ3 系と k-quant は、重み 256 個を 1 ブロックにまとめる型です。256 で割り切れない行は保存できません。ツールではなく、型そのものの制限です | llama-quantize と同じ代わりの型にします：IQ1/IQ2/IQ3 系と IQ4_XS → IQ4_NL、Q2_K/Q3_K → Q4_0、Q4_K → Q5_0、Q5_K → Q5_1、Q6_K → Q8_0（それも合わなければ F16）。unsloth や ISTA の Qwen3.8 も、ここは IQ4_NL です |
+| そのテンソルの imatrix のデータがない | 予測用の追加の層（NextN / MTP）：Ornith-1.5 の `blk.48`、GLM-5.3-Flash の `blk.45` | imatrix を作るときに、その層を通っていません。IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S は imatrix が必須です（llama-quantize も「結果がでたらめになる」と止まります） | 元のまま残します。imatrix が要らない型の規則を、ほかの規則より上に書いてください（例：`blk\.48\.ffn_\w+_exps\.weight  iq4_xs`） |
+| gate と up が 1 本にまとまっている | Gemma 4 の `ffn_gate_up_exps` | テンソルが 2 本ではなく 1 本です | 量子化できます。規則に `ffn_gate_up_exps` を書く必要があります |
+
+**対象外のもの**
+
+| 場合 | 例 | 原因 |
+| --- | --- | --- |
+| 密なモデル | Qwen3.8-27B、Gemma 4 12B / 31B、MiniCPM5 | エキスパートのテンソルがありません。trench-gguf は MoE のエキスパートだけを書き直します（密なモデルへの対応は今後の予定） |
+| フォーク独自のテンソルの型 | ROCmFP4 の版（型 101）、Ternary Bonsai の PQ2_0 / PTQ1_0（型 142 / 143） | 本家の llama.cpp にない型です。gguf-py が見出しを読めず、ggml も元の重みに戻せません |
+| そのモデルの imatrix がない | DeepSeek V4 Flash 0731（unsloth は公開していない） | IQ1/IQ2 系には imatrix が必須です。`llama-imatrix` で作るか、配布元のものを使ってください |
+
 ## 🛠️ 使い方
 
 ### モデルのエキスパートを量子化し直す
@@ -276,7 +310,8 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
 ## ⚠️ 制限
 
-- **型**：対応しているのは IQ2_XXS、IQ2_S、IQ1_S、IQ1_M です。IQ2_XS と IQ3_XXS が次の予定で、それ以外の型は CPU で計算します。
+- **型**：GPU で計算するのは IQ2_XXS、IQ2_S、IQ1_S、IQ1_M です。IQ2_XS と IQ3_XXS が次の予定です。それ以外の型（代わりの型の IQ4_NL も）は、ggml を通して CPU で計算します。
+- **モデル**：MoE のエキスパートだけが対象です。代わりの型になるテンソルとその理由は、[対応するモデル](#-対応するモデル)を見てください。
 - **CUDA**：ビルドはできますが、NVIDIA の GPU での一致はまだ確かめていません。
 - **環境**：確かめたのは x86-64 の Linux だけです。
   - ARM では gcc がふつうに FMA を使うので、ggml の CPU の出力そのものが変わります。
@@ -286,7 +321,7 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
   - bed0a8566 から写し、ac8e1694d でも確かめ直しました。
   - それより古い llama.cpp は、IQ1_M の探索のやり方が違います。
   - 更新したら、自己テストを流してください。
-- **imatrix が必須**です（llama.cpp でも、これらの型では必須です）。
+- **imatrix が必須**です（llama.cpp でも、IQ1/IQ2 系では必須です）。imatrix にデータのないテンソルは、imatrix が要らない型なら imatrix なしで作り、IQ1/IQ2 系なら元のまま残します。
 
 ## 🗺️ 今後の予定
 
