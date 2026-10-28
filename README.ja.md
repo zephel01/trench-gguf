@@ -136,7 +136,8 @@ df -h .
 - 途中で止まったら、同じコマンドをもう一度流すと続きから再開します。
 
 ```bash
-hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-Q4_K_XL/*" "imatrix_unsloth.gguf_file"
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-Q4_K_XL/*" --include "imatrix_unsloth.gguf_file"
 ```
 
 **手順 3：規則ファイルを作る。** エキスパートのテンソルごとに、どの型にするかを書きます（0〜9 層の gate/up は IQ1_S、など）。
@@ -178,7 +179,8 @@ ls -lh down1
 **手順 6（任意）：層ごとに組み合わせる。** unsloth の UD-IQ2_XXS（301 GB）を土台にして、0〜3 層だけを `down1` から取ります。
 
 ```bash
-hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-IQ2_XXS/*"
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-IQ2_XXS/*"
 python ~/trench-gguf/tools/merge_experts.py \
   UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
   down1/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf \

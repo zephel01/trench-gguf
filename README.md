@@ -120,7 +120,8 @@ If your big disk is mounted somewhere else (for example `/mnt/data`), use that i
 run the same command again: it continues.
 
 ```bash
-hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-Q4_K_XL/*" "imatrix_unsloth.gguf_file"
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-Q4_K_XL/*" --include "imatrix_unsloth.gguf_file"
 ```
 
 **Step 3 — the rules file.** Which type each expert tensor gets: layer 0-9 gate/up IQ1_S, and so on.
@@ -161,7 +162,8 @@ the source's, so it takes no space on the same disk.
 **Step 6 (optional) — mix per layer.** Keep unsloth's UD-IQ2_XXS (301 GB) and take only layers 0-3 from `down1`:
 
 ```bash
-hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-IQ2_XXS/*"
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-IQ2_XXS/*"
 python ~/trench-gguf/tools/merge_experts.py \
   UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
   down1/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf \
