@@ -80,12 +80,12 @@ The tool itself is small; the models are not. For the [walkthrough](#-walkthroug
 
 | What | How much | Why |
 | --- | --- | --- |
-| free disk space | **about 600 GB** (+ 470 GB for step 6) | the source GGUF 467 GB + the output 132 GB |
-| disk type | an NVMe SSD (a HDD works, but slowly) | 270 GB is read and 132 GB written |
+| free disk space | **about 650 GB** (+ 350 GB for step 6) | the source GGUF 501 GB + the output 141 GB |
+| disk type | an NVMe SSD (a HDD works, but slowly) | 290 GB is read and 141 GB written |
 | RAM | 32 GB or more (estimate) | the GGUF is memory-mapped; each CPU thread holds one expert as floats (47 MB) |
 | CPU | any x86-64; more cores = faster | turning the source weights back into floats runs on all threads |
 | GPU | one ROCm or CUDA GPU, 1 GB of free memory | the quantizer; checked on an AI PRO R9700 |
-| network | a fast line | 467 GB: about 1 h at 1 Gbps, about 9 h at 100 Mbps |
+| network | a fast line | 501 GB: about 1 h 10 min at 1 Gbps, about 11 h at 100 Mbps |
 | the tool | about 750 MB | trench-gguf + llama.cpp + the Python venv |
 
 Tested on: Ryzen with 16 cores / 32 threads, 94 GB RAM, AI PRO R9700, a Gen4 NVMe SSD.
@@ -104,7 +104,7 @@ cd trench-gguf
 ./setup.sh
 ```
 
-**Step 1 — a work folder.** Put it on a disk with about 600 GB free. `df -h .` prints the free space (`Avail`).
+**Step 1 — a work folder.** Put it on a disk with about 650 GB free. `df -h .` prints the free space (`Avail`).
 
 ```bash
 source ~/trench-gguf/trench.env
@@ -116,7 +116,7 @@ df -h .
 If your big disk is mounted somewhere else (for example `/mnt/data`), use that instead:
 `mkdir -p /mnt/data/gguf-work/DeepSeek-V4.1 && cd /mnt/data/gguf-work/DeepSeek-V4.1`.
 
-**Step 2 — download the source (467 GB) and the imatrix.** `hf` was installed by `setup.sh`. If the download stops,
+**Step 2 — download the source (501 GB) and the imatrix.** `hf` was installed by `setup.sh`. If the download stops,
 run the same command again: it continues.
 
 ```bash
@@ -155,10 +155,10 @@ python ~/trench-gguf/tools/requant_experts.py \
 ls -lh down1
 ```
 
-`down1/` now holds 9 shards with the source's names. Shard 8 (the 189 GB Engram table, no experts) is a hard link to
+`down1/` now holds 9 shards (141 GB without shard 8) with the source's names. Shard 8 (the 203 GB Engram table, no experts) is a hard link to
 the source's, so it takes no space on the same disk.
 
-**Step 6 (optional) — mix per layer.** Keep unsloth's UD-IQ2_XXS (280 GB) and take only layers 0-3 from `down1`:
+**Step 6 (optional) — mix per layer.** Keep unsloth's UD-IQ2_XXS (301 GB) and take only layers 0-3 from `down1`:
 
 ```bash
 hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-IQ2_XXS/*"
@@ -169,7 +169,7 @@ python ~/trench-gguf/tools/merge_experts.py \
 ls -lh mix
 ```
 
-Only shard 2 (layers 0-3) is written again (about 45 GB); the other shards are hard links.
+Only shard 2 (layers 0-3) is written again (about 49 GB); the other shards are hard links.
 
 **If something goes wrong**
 
@@ -231,7 +231,7 @@ AI PRO R9700 (OCuLink Gen4 x4), 16-core Ryzen (32 threads), DeepSeek V4.1 Flash 
 | one expert (11.8 M weights) | 0.5-2.5 s, one thread | 0.010-0.028 s |
 | one tensor (384 experts) | about 27 s, 32 threads | about 5 s |
 | one layer (gate / up / down) into a GGUF | 1 min 54 s | 29 s, `cmp`-identical |
-| all 120 expert tensors (269 GiB MXFP4 → 123 GiB) | about 1 h (estimate) | 15.5 min |
+| all 120 expert tensors (289 GB MXFP4 → 132 GB) | about 1 h (estimate) | 15.5 min |
 
 About half of the GPU's time is the float weights crossing PCIe.
 
