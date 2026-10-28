@@ -4,7 +4,7 @@
 #   2. its libggml-base.so (the CPU quantizer the GPU output must match; nothing else of llama.cpp is built)
 #   3. the GPU: ROCm (hipcc + rocminfo) or CUDA (nvcc + nvidia-smi), and its architecture
 #   4. gpuq/gpuq_tables.bin + gpuq/libgpuq.so (ROCm) or gpuq/libgpuq_cuda.so (CUDA)   (build.sh)
-#   5. a Python venv (.venv) with numpy and llama.cpp's gguf-py
+#   5. a Python venv (.venv) with numpy, huggingface_hub (the hf command) and llama.cpp's gguf-py
 #   6. the self-test: random weights quantized on the CPU (ggml) and on the GPU, byte for byte
 #   7. trench.env: `source trench.env` sets LIBGGML / GPUQ_LIB for tools/*.py
 #
@@ -91,8 +91,8 @@ step 5/7 "Python (.venv)"
 if [ ! -x .venv/bin/python ]; then
   python3 -m venv .venv || fail "python3 -m venv" "sudo apt install python3-venv"
 fi
-.venv/bin/pip install --quiet --upgrade pip numpy "$LLAMA/gguf-py" > "$ROOT/setup-pip.log" 2>&1 \
-  || fail "pip install numpy gguf-py" "see setup-pip.log"
+.venv/bin/pip install --quiet --upgrade pip numpy huggingface_hub "$LLAMA/gguf-py" > "$ROOT/setup-pip.log" 2>&1 \
+  || fail "pip install numpy huggingface_hub gguf-py" "see setup-pip.log"
 ok "$(.venv/bin/python -c 'import numpy, gguf; print("numpy", numpy.__version__, "/ gguf", getattr(gguf, "__version__", "?"))')"
 
 step 6/7 "self-test (byte-identical to ggml)"

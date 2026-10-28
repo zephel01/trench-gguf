@@ -7,7 +7,7 @@ usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix
       blk\\.(2[4-9]|30)\\.ffn_(gate|up)_exps\\.weight  iq3_xxs
       blk\\.\\d+\\.ffn_down_exps\\.weight             iq2_s
 Each input shard becomes one output shard of the same name (the split metadata is copied as is); a missing shard is
-skipped (DeepSeek V4.1: a shard holding only the Engram table).  Each expert is dequantized with ggml's own to_float
+skipped, and one gguf-py cannot read (DeepSeek V4.1's Engram-only shard) is copied as is.  Each expert is dequantized with ggml's own to_float
 (any source type ggml reads: MXFP4, the i-quants, the k-quants) and quantized by ggml_quantize_chunk with that
 expert's imatrix row (llama-quantize's normalization: in_sum2 / counts, 1 for an expert the calibration never routed
 to).  The source's rounding error and the new one add up: start from the most precise file to hand.
@@ -23,6 +23,7 @@ import concurrent.futures
 import ctypes
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -118,7 +119,20 @@ def main() -> int:
         if not os.path.isfile(sh):
             print("%s is not there: skipped" % sh)
             continue
-        r = gguf.GGUFReader(sh)
+        try:
+            r = gguf.GGUFReader(sh)
+        except ValueError as e:   # a tensor type gguf-py does not know (DeepSeek V4.1's Engram shard): no experts in it
+            out = os.path.join(out_dir, os.path.basename(sh))
+            print("%s: gguf-py cannot read it (%s): kept as is (hard link or copy)" % (sh, e), flush=True)
+            if check:
+                continue
+            if os.path.exists(out):
+                os.remove(out)
+            try:
+                os.link(os.path.realpath(sh), out)   # (no space used on the same disk)
+            except OSError:
+                shutil.copyfile(sh, out)
+            continue
         if gguf.Keys.General.ARCHITECTURE in r.fields:   # (the later shards of a split carry only the split keys)
             arch = r.fields[gguf.Keys.General.ARCHITECTURE].contents()
         out = os.path.join(out_dir, os.path.basename(sh))

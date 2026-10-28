@@ -13,7 +13,7 @@
 
 **English** · [日本語](README.ja.md)
 
-[Quick start](#-quick-start) · [Usage](#️-usage) · [Performance](#-performance) · [How it works](#-how-it-works) ·
+[Quick start](#-quick-start) · [Walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step) · [Usage](#️-usage) · [Performance](#-performance) · [How it works](#-how-it-works) ·
 [Limits](#️-limits) · [Credits](#-credits)
 
 </div>
@@ -49,10 +49,11 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
 ## 🚀 Quick start
 
 ```bash
+cd ~
 git clone https://github.com/zephel01/trench-gguf
 cd trench-gguf
 ./setup.sh                 # llama.cpp, libggml-base, the GPU library, a Python venv, the self-test
-source trench.env
+source ~/trench-gguf/trench.env    # in every new terminal
 ```
 
 `setup.sh` ends with the self-test. `OK: byte-identical to ggml` means the GPU output matches your llama.cpp.
@@ -73,9 +74,117 @@ source trench.env
 | a GPU | AI PRO R9700 (gfx1201); RTX 50 (sm_120) needs CUDA 12.8 or later |
 | GPU memory | a few hundred MB |
 
+### What the machine needs
+
+The tool itself is small; the models are not. For the [walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step):
+
+| What | How much | Why |
+| --- | --- | --- |
+| free disk space | **about 600 GB** (+ 470 GB for step 6) | the source GGUF 467 GB + the output 132 GB |
+| disk type | an NVMe SSD (a HDD works, but slowly) | 270 GB is read and 132 GB written |
+| RAM | 32 GB or more (estimate) | the GGUF is memory-mapped; each CPU thread holds one expert as floats (47 MB) |
+| CPU | any x86-64; more cores = faster | turning the source weights back into floats runs on all threads |
+| GPU | one ROCm or CUDA GPU, 1 GB of free memory | the quantizer; checked on an AI PRO R9700 |
+| network | a fast line | 467 GB: about 1 h at 1 Gbps, about 9 h at 100 Mbps |
+| the tool | about 750 MB | trench-gguf + llama.cpp + the Python venv |
+
+Tested on: Ryzen with 16 cores / 32 threads, 94 GB RAM, AI PRO R9700, a Gen4 NVMe SSD.
+
+## 📘 Walkthrough: DeepSeek V4.1 Flash, step by step
+
+Every command below runs as is. What you get: DeepSeek V4.1 Flash (1017) with **every expert one step below unsloth's
+UD-IQ2_XXS**, made from unsloth's UD-Q4_K_XL (whose experts are the released MXFP4 weights) and unsloth's imatrix.
+
+**Step 0 — the tool** (once; skip it if you did the [Quick start](#-quick-start))
+
+```bash
+cd ~
+git clone https://github.com/zephel01/trench-gguf
+cd trench-gguf
+./setup.sh
+```
+
+**Step 1 — a work folder.** Put it on a disk with about 600 GB free. `df -h .` prints the free space (`Avail`).
+
+```bash
+source ~/trench-gguf/trench.env
+mkdir -p ~/gguf-work/DeepSeek-V4.1
+cd ~/gguf-work/DeepSeek-V4.1
+df -h .
+```
+
+If your big disk is mounted somewhere else (for example `/mnt/data`), use that instead:
+`mkdir -p /mnt/data/gguf-work/DeepSeek-V4.1 && cd /mnt/data/gguf-work/DeepSeek-V4.1`.
+
+**Step 2 — download the source (467 GB) and the imatrix.** `hf` was installed by `setup.sh`. If the download stops,
+run the same command again: it continues.
+
+```bash
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-Q4_K_XL/*" "imatrix_unsloth.gguf_file"
+```
+
+**Step 3 — the rules file.** Which type each expert tensor gets: layer 0-9 gate/up IQ1_S, and so on.
+
+```bash
+cat > rules-down1.txt <<'RULES'
+blk\.[0-9]\.ffn_(gate|up)_exps\.weight              iq1_s
+blk\.[0-9]\.ffn_down_exps\.weight                   iq1_m
+blk\.(1[0-9]|2[0-4])\.ffn_(gate|up)_exps\.weight    iq1_m
+blk\.1[0-9]\.ffn_down_exps\.weight                  iq2_xxs
+blk\.2[0-4]\.ffn_down_exps\.weight                  iq2_s
+blk\.(2[5-9]|3[0-9])\.ffn_(gate|up)_exps\.weight    iq2_xxs
+blk\.(2[5-9]|3[0-4])\.ffn_down_exps\.weight         iq2_s
+blk\.3[5-9]\.ffn_down_exps\.weight                  iq2_xxs
+RULES
+```
+
+**Step 4 — a dry run** (writes nothing). The last line should read `re-quantized 268.95 GiB -> 122.61 GiB (check only)`.
+
+```bash
+python ~/trench-gguf/tools/requant_experts.py \
+  UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf down1 rules-down1.txt \
+  --imatrix=imatrix_unsloth.gguf_file --check
+```
+
+**Step 5 — the real run** (15.5 min on the test machine). Each expert tensor prints one line ending in `(gpu)`.
+
+```bash
+python ~/trench-gguf/tools/requant_experts.py \
+  UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf down1 rules-down1.txt \
+  --imatrix=imatrix_unsloth.gguf_file --gpu
+ls -lh down1
+```
+
+`down1/` now holds 9 shards with the source's names. Shard 8 (the 189 GB Engram table, no experts) is a hard link to
+the source's, so it takes no space on the same disk.
+
+**Step 6 (optional) — mix per layer.** Keep unsloth's UD-IQ2_XXS (280 GB) and take only layers 0-3 from `down1`:
+
+```bash
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-IQ2_XXS/*"
+python ~/trench-gguf/tools/merge_experts.py \
+  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  down1/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf \
+  mix DeepSeek-V4.1-Flash-1017-mix 0-3
+ls -lh mix
+```
+
+Only shard 2 (layers 0-3) is written again (about 45 GB); the other shards are hard links.
+
+**If something goes wrong**
+
+| Message | What to do |
+| --- | --- |
+| `No space left on device` | free space or move the work folder to a bigger disk (Step 1) |
+| `hf: command not found` / `python: ... numpy` | run `source ~/trench-gguf/trench.env` in this terminal |
+| `gpuq_init failed` | the GPU is not visible: `rocminfo` or `nvidia-smi` should list it; run `./setup.sh` again |
+| `MISMATCH` in `setup.sh`'s self-test | do not use `--gpu`; open an issue with `setup-test.log` |
+
 ## 🛠️ Usage
 
 ### Re-quantize a model's experts
+
+The general form (the [walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step) fills it in):
 
 ```bash
 python tools/requant_experts.py <source shard 1> <out folder> <rules file> --imatrix=<imatrix.gguf> --gpu

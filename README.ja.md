@@ -13,7 +13,7 @@
 
 [English](README.md) · **日本語**
 
-[はじめかた](#-はじめかた) · [使い方](#️-使い方) · [速さ](#-速さ) · [仕組み](#-仕組み) · [制限](#️-制限) ·
+[はじめかた](#-はじめかた) · [実例](#-実例-deepseek-v41-flash-を一から作る) · [使い方](#️-使い方) · [速さ](#-速さ) · [仕組み](#-仕組み) · [制限](#️-制限) ·
 [謝辞](#-謝辞)
 
 </div>
@@ -59,10 +59,11 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
 ## 🚀 はじめかた
 
 ```bash
+cd ~
 git clone https://github.com/zephel01/trench-gguf
 cd trench-gguf
 ./setup.sh                 # llama.cpp、libggml-base、GPU 用ライブラリ、Python の venv、自己テスト
-source trench.env
+source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 ```
 
 `setup.sh` の最後に自己テストが走ります。`OK: byte-identical to ggml` と出れば、GPU の出力があなたの llama.cpp と一致しています。
@@ -85,9 +86,122 @@ source trench.env
 | GPU | AI PRO R9700（gfx1201）。RTX 50 系（sm_120）は CUDA 12.8 以降 |
 | GPU のメモリ | 数百 MB |
 
+### マシンに必要なもの
+
+ツール自体は小さいですが、扱うモデルは大きいです。[手順の実例](#-実例-deepseek-v41-flash-を一から作る)で必要なのは次のとおりです。
+
+| 必要なもの | 量 | 理由 |
+| --- | --- | --- |
+| ディスクの空き | **約 600 GB**（手順 6 もやるなら +470 GB） | 元の GGUF 467 GB + 出力 132 GB |
+| ディスクの種類 | NVMe SSD（HDD でも動くが遅い） | 270 GB を読み、132 GB を書く |
+| メモリ（RAM） | 32 GB 以上（目安） | GGUF をメモリに割り当てて読む。CPU のスレッドごとに、エキスパート 1 個分の float（47 MB）を持つ |
+| CPU | x86-64 なら何でも。コアが多いほど速い | 元の重みを float に戻す処理を、全スレッドで行う |
+| GPU | ROCm か CUDA の GPU 1 枚。空きメモリ 1 GB | 量子化そのもの。確かめたのは AI PRO R9700 |
+| 回線 | 速いほど良い | 467 GB は、1 Gbps で約 1 時間、100 Mbps で約 9 時間 |
+| ツール本体 | 約 750 MB | trench-gguf + llama.cpp + Python の venv |
+
+確かめたマシン：Ryzen 16 コア / 32 スレッド、メモリ 94 GB、AI PRO R9700、Gen4 の NVMe SSD。
+
+## 📘 実例: DeepSeek V4.1 Flash を一から作る
+
+下のコマンドは、どれもそのままコピペで動きます。
+
+作るもの：DeepSeek V4.1 Flash（1017）で、**すべてのエキスパートを unsloth の UD-IQ2_XXS より 1 段低い型**にしたものです。
+- 元にするのは unsloth の UD-Q4_K_XL です。エキスパートが配布元の MXFP4 のまま入っています。
+- imatrix は unsloth のものを使います。
+
+**手順 0：ツールを用意する**（最初の 1 回だけ。[はじめかた](#-はじめかた)を済ませていれば不要）
+
+```bash
+cd ~
+git clone https://github.com/zephel01/trench-gguf
+cd trench-gguf
+./setup.sh
+```
+
+**手順 1：作業フォルダを作る。** 空きが約 600 GB あるディスクに作ります。`df -h .` の `Avail`（空き）で確かめます。
+
+```bash
+source ~/trench-gguf/trench.env
+mkdir -p ~/gguf-work/DeepSeek-V4.1
+cd ~/gguf-work/DeepSeek-V4.1
+df -h .
+```
+
+大きいディスクが別の場所（たとえば `/mnt/data`）にあるなら、代わりにこちらを使います。
+`mkdir -p /mnt/data/gguf-work/DeepSeek-V4.1 && cd /mnt/data/gguf-work/DeepSeek-V4.1`
+
+**手順 2：元の GGUF（467 GB）と imatrix をダウンロードする。**
+- `hf` コマンドは `setup.sh` が入れています。
+- 途中で止まったら、同じコマンドをもう一度流すと続きから再開します。
+
+```bash
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-Q4_K_XL/*" "imatrix_unsloth.gguf_file"
+```
+
+**手順 3：規則ファイルを作る。** エキスパートのテンソルごとに、どの型にするかを書きます（0〜9 層の gate/up は IQ1_S、など）。
+
+```bash
+cat > rules-down1.txt <<'RULES'
+blk\.[0-9]\.ffn_(gate|up)_exps\.weight              iq1_s
+blk\.[0-9]\.ffn_down_exps\.weight                   iq1_m
+blk\.(1[0-9]|2[0-4])\.ffn_(gate|up)_exps\.weight    iq1_m
+blk\.1[0-9]\.ffn_down_exps\.weight                  iq2_xxs
+blk\.2[0-4]\.ffn_down_exps\.weight                  iq2_s
+blk\.(2[5-9]|3[0-9])\.ffn_(gate|up)_exps\.weight    iq2_xxs
+blk\.(2[5-9]|3[0-4])\.ffn_down_exps\.weight         iq2_s
+blk\.3[5-9]\.ffn_down_exps\.weight                  iq2_xxs
+RULES
+```
+
+**手順 4：試しに流す**（何も書き出しません）。最後の行が `re-quantized 268.95 GiB -> 122.61 GiB (check only)` なら正しく準備できています。
+
+```bash
+python ~/trench-gguf/tools/requant_experts.py \
+  UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf down1 rules-down1.txt \
+  --imatrix=imatrix_unsloth.gguf_file --check
+```
+
+**手順 5：本番。** 確かめたマシンで 15 分半でした。エキスパートのテンソル 1 本ごとに、行末が `(gpu)` の行が出ます。
+
+```bash
+python ~/trench-gguf/tools/requant_experts.py \
+  UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf down1 rules-down1.txt \
+  --imatrix=imatrix_unsloth.gguf_file --gpu
+ls -lh down1
+```
+
+`down1/` に、元と同じ名前のシャードが 9 個できます。
+- シャード 8 は Engram の表（189 GB）で、エキスパートを含みません。
+- これは元のファイルへのハードリンクなので、同じディスクなら容量を使いません。
+
+**手順 6（任意）：層ごとに組み合わせる。** unsloth の UD-IQ2_XXS（280 GB）を土台にして、0〜3 層だけを `down1` から取ります。
+
+```bash
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --local-dir . --include "UD-IQ2_XXS/*"
+python ~/trench-gguf/tools/merge_experts.py \
+  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  down1/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf \
+  mix DeepSeek-V4.1-Flash-1017-mix 0-3
+ls -lh mix
+```
+
+書き直されるのは、0〜3 層を含むシャード 2（約 45 GB）だけです。ほかのシャードはハードリンクです。
+
+**うまくいかないとき**
+
+| 出たメッセージ | どうするか |
+| --- | --- |
+| `No space left on device` | 空きを作るか、作業フォルダを大きいディスクに移す（手順 1） |
+| `hf: command not found`、`python: ... numpy` | そのターミナルで `source ~/trench-gguf/trench.env` を流す |
+| `gpuq_init failed` | GPU が見えていない。`rocminfo` か `nvidia-smi` に GPU が出るか確かめ、`./setup.sh` をもう一度流す |
+| `setup.sh` の自己テストで `MISMATCH` | `--gpu` を使わない。`setup-test.log` を付けて issue を立てる |
+
 ## 🛠️ 使い方
 
 ### モデルのエキスパートを量子化し直す
+
+一般的な書き方です（具体的な値を入れたものは[実例](#-実例-deepseek-v41-flash-を一から作る)にあります）。
 
 ```bash
 python tools/requant_experts.py <元のシャード 1> <出力フォルダ> <規則ファイル> --imatrix=<imatrix.gguf> --gpu

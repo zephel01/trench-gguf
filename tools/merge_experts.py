@@ -3,8 +3,8 @@ files with the listed layers' ffn_{gate,up,down}_exps taken byte for byte from t
 the result is exactly the mix that a native_experts.txt row swap measured.
 
 usage: merge_experts.py <base shard 1> <donor shard 1> <out dir> <out stem> <layers, e.g. 0,1,2,5-9> [--check]
-  Each base shard becomes <out stem>-NNNNN-of-MMMMM.gguf (the base's split); a shard with no swapped tensor is copied
-  as is. Donor shards that are not there are skipped (V4.1: the Engram-only shard). GGUF_PY as in requant_experts.py.
+  Each base shard becomes <out stem>-NNNNN-of-MMMMM.gguf (the base's split); a shard with no swapped tensor is hard-linked
+  (a copy on another disk). Donor shards that are not there are skipped (V4.1: the Engram-only shard). GGUF_PY as in requant_experts.py.
 """
 import os
 import re
@@ -23,6 +23,16 @@ def shards_of(first):
         return [first]
     return [os.path.join(os.path.dirname(first), "%s-%05d-of-%s.gguf" % (m.group(1), i, m.group(3)))
             for i in range(1, int(m.group(3)) + 1)]
+
+
+def link_or_copy(src, dst):
+    """A hard link when both are on one disk (no space used), a copy otherwise."""
+    if os.path.exists(dst):
+        os.remove(dst)
+    try:
+        os.link(os.path.realpath(src), dst)
+    except OSError:
+        shutil.copyfile(src, dst)
 
 
 def parse_layers(s):
@@ -50,7 +60,11 @@ def main():
         if not os.path.isfile(sh):
             print("donor %s is not there: skipped" % os.path.basename(sh))
             continue
-        r = gguf.GGUFReader(sh)
+        try:
+            r = gguf.GGUFReader(sh)
+        except ValueError:   # a tensor type gguf-py does not know (DeepSeek V4.1's Engram shard): no experts in it
+            print("donor %s: gguf-py cannot read it: skipped" % os.path.basename(sh))
+            continue
         for t in r.tensors:
             m = pat.match(t.name)
             if m and int(m.group(1)) in take:
@@ -64,7 +78,15 @@ def main():
     for sh in shards_of(base1):
         m = re.match(r".*-(\d{5}-of-\d{5})\.gguf$", os.path.basename(sh))
         out = os.path.join(out_dir, "%s-%s.gguf" % (stem, m.group(1)) if m else "%s.gguf" % stem)
-        r = gguf.GGUFReader(sh)
+        try:
+            r = gguf.GGUFReader(sh)
+        except ValueError:
+            r = None
+        if r is None:
+            print("%s -> %s: gguf-py cannot read it: kept as is (hard link or copy)" % (os.path.basename(sh), os.path.basename(out)))
+            if not check:
+                link_or_copy(sh, out)
+            continue
         swap = [t.name for t in r.tensors if t.name in donor]
         print("%s -> %s: %d tensors swapped" % (os.path.basename(sh), os.path.basename(out), len(swap)), flush=True)
         for t in r.tensors:
@@ -74,7 +96,7 @@ def main():
         if check:
             continue
         if not swap:
-            shutil.copyfile(sh, out)
+            link_or_copy(sh, out)
             continue
         arch = None
         if gguf.Keys.General.ARCHITECTURE in r.fields:
