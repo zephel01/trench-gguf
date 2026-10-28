@@ -1,0 +1,9 @@
+gpuq/gpuq_tables
+gpuq/gpuq_tables.bin
+gpuq/*.so
+__pycache__/
+*.gguf
+third_party/
+.venv/
+trench.env
+setup-*.log
