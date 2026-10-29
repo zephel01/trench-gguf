@@ -270,3 +270,37 @@ def quantize_matrix_iq2xxs_sub(W, quant, tab, U, perm, imatrix, sub=32, scale_se
         enc = tab.encode(d, new_ls, gidx, sidx)
         out[:, blk_order[k], :] = enc
     return out.reshape(ne1, nblk * tsize), deq, {}
+
+
+def prepare_hessian_torch(H, n, damp=0.01, order="seq", bs=QK_K, device="cuda"):
+    """prepare_hessian with torch on `device` (float32 on a GPU is enough for a damped H; float64 on the CPU).
+    H: numpy [ne0, ne0]. Returns numpy (U float64, perm, diag_n, dead) like prepare_hessian."""
+    import torch
+    dt = torch.float64 if device == "cpu" else torch.float32
+    ne0 = H.shape[0]
+    Hn = torch.as_tensor(np.asarray(H), dtype=torch.float64).to(device) / max(float(n), 1.0)
+    d = torch.diagonal(Hn).clone()
+    dead = d <= 0
+    if bool(dead.any()):
+        Hn[dead, :] = 0
+        Hn[:, dead] = 0
+        Hn[dead, dead] = 1.0
+        d = torch.diagonal(Hn).clone()
+    nblk = ne0 // bs
+    if order == "act":
+        blk_order = torch.argsort(-d.reshape(nblk, bs).sum(1), stable=True)
+    else:
+        blk_order = torch.arange(nblk, device=device)
+    perm = (blk_order[:, None] * bs + torch.arange(bs, device=device)[None]).reshape(-1)
+    Hp = Hn[perm][:, perm].to(dt)
+    mean_d = float(torch.diagonal(Hp).mean())
+    Hp.diagonal().add_(damp * mean_d)
+    try:
+        Lc = torch.linalg.cholesky(Hp)
+    except Exception:
+        Hp.diagonal().add_(10 * damp * mean_d)
+        Lc = torch.linalg.cholesky(Hp)
+    Hinv = torch.cholesky_inverse(Lc)
+    Hinv = 0.5 * (Hinv + Hinv.T)
+    U = torch.linalg.cholesky(Hinv, upper=True)
+    return (U.double().cpu().numpy(), perm.cpu().numpy(), d[perm].cpu().numpy(), dead.cpu().numpy())

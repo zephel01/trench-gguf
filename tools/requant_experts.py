@@ -5,6 +5,7 @@ the same way as one expert.
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
                          [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--order=seq|act] [--weights=imatrix|diag|schur]
                          [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
+                         [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]]
   rules file: one "<tensor name regex> <type>" a line (# comments), the first match wins, e.g.
       blk\\.(2[4-9]|30)\\.ffn_(gate|up)_exps\\.weight  iq3_xxs
       blk\\.\\d+\\.ffn_down_exps\\.weight             iq2_s
@@ -37,6 +38,10 @@ update (a check: the bytes must then equal the plain run). --sub=32 / 8 (IQ2_XXS
 sub-block / codebook group inside the super-block with ggml's scales kept and the points chosen again against the
 inference grid; --scale-search=K also tries the 4-bit sub-block scales K steps around ggml's. Tensors without a Hessian
 file are quantized as before.
+--dump=<dir> takes the Hessians from a tools/hessian_dump dump instead (blk.L.x.bf16 + ids): built per expert on the
+fly (tools/hessian_from_dump.py; the down input recomputed from the expert's own gate/up), the factorization in torch
+on --dump-device (cuda = ROCm/CUDA; numpy = no torch at all), gate and up of an expert done together. For a model
+with 256 experts of 4096 inputs this keeps one expert's Hessian in memory at a time instead of 20 GB a layer.
 
 Environment: GGUF_PY = llama.cpp/gguf-py (default: the installed gguf package), LIBGGML = <llama.cpp build>/bin/
 libggml-base.so (the CPU quantizer, and the reference the GPU output matches).
@@ -130,6 +135,55 @@ def _fork_call(e):
     return got, _FORK_DST(e)
 
 
+class Shards:
+    """All shards of a split GGUF by tensor name, opened lazily; dequantizes one expert through ggml's to_float."""
+
+    def __init__(self, shard1, lib=None):
+        m = re.match(r"(.*)-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(shard1))
+        self.paths = [shard1] if m is None else [
+            os.path.join(os.path.dirname(shard1), "%s-%05d-of-%s.gguf" % (m.group(1), i, m.group(3)))
+            for i in range(1, int(m.group(3)) + 1)]
+        self.readers = {}
+        self.where = {}
+        for p in self.paths:
+            if not os.path.isfile(p):
+                continue
+            try:
+                r = gguf.GGUFReader(p)
+            except ValueError:
+                continue
+            self.readers[p] = r
+            for t in r.tensors:
+                self.where[t.name] = (p, t)
+        self.lib = lib or ctypes.CDLL(LIBGGML)
+        self.lib.ggml_get_type_traits.restype = ctypes.POINTER(TypeTraits)
+        self.lib.ggml_get_type_traits.argtypes = [ctypes.c_int]
+        self.to_float = {}
+
+    def tensor(self, name):
+        return self.where[name][1]
+
+    def dequant_expert(self, name, e):
+        """expert e of a 3-D tensor as float32 [ne1, ne0]"""
+        t = self.tensor(name)
+        ne0, ne1, ne2 = (int(x) for x in t.shape)
+        src = t.tensor_type
+        if src not in self.to_float:
+            self.to_float[src] = TO_FLOAT(self.lib.ggml_get_type_traits(int(src)).contents.to_float)
+        raw = np.ascontiguousarray(np.asarray(t.data).reshape(ne2, -1)[e])
+        f32 = np.empty(ne1 * ne0, dtype=np.float32)
+        self.to_float[src](raw.ctypes.data, f32.ctypes.data, ne1 * ne0)
+        return f32.reshape(ne1, ne0)
+
+
+def open_shards(shard1):
+    return Shards(shard1)
+
+
+def dequant_expert(shards, name, e):
+    return shards.dequant_expert(name, e)
+
+
 def read_imatrix(path):
     r = gguf.GGUFReader(path)
     sums, counts = {}, {}
@@ -161,9 +215,16 @@ def main() -> int:
                 "sub": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--sub=")), 0)),
                 "scale_search": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--scale-search=")), 0))}
     hess_cache = {}
-    if hess_dir:
+    stash = {}
+    dump_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--dump=")), None)
+    dump_device = next((a.split("=", 1)[1] for a in flags if a.startswith("--dump-device=")), "cpu")
+    dump = src_shards = None
+    if hess_dir or dump_dir:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import ldlq
+    if dump_dir:
+        from hessian_from_dump import DumpHessians
+        dump = DumpHessians(dump_dir, dump_device if dump_device != "numpy" else "cpu")
     if len(args) != 3 or imat_path is None:
         print(__doc__)
         return 2
@@ -171,6 +232,8 @@ def main() -> int:
     rules = read_rules(rules_path)
     imat = read_imatrix(imat_path)
     lib = ctypes.CDLL(LIBGGML)
+    if dump_dir:
+        src_shards = Shards(shard1, lib)
     lib.ggml_quantize_chunk.restype = ctypes.c_size_t
     lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
                                         ctypes.c_int64, ctypes.c_void_p]
@@ -304,15 +367,36 @@ def main() -> int:
             on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
             gpu_dq = on_gpu and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
 
-            hess = hess_file(hess_dir, t.name, hess_opt["gated"]) if hess_dir and len(t.shape) == 3 else None
+            # error-feedback rounding: a Hessian provider per tensor, from files (--hessian) or from a dump (--dump)
+            hess = None
+            get_H = None
+            if hess_dir and len(t.shape) == 3:
+                hf = hess_file(hess_dir, t.name, hess_opt["gated"])
+                if hf is not None:
+                    H_all = np.load(hf[0], mmap_mode="r")
+                    H_counts = np.load(hf[1])
+                    if H_all.shape != (ne2, ne0, ne0):
+                        print("  %s: Hessian %s does not fit [%d x %d x %d]: plain rounding" % (t.name, H_all.shape, ne2, ne0, ne0))
+                    else:
+                        hess = os.path.basename(hf[0])
+                        get_H = lambda e, H_all=H_all, H_counts=H_counts: (np.asarray(H_all[e], dtype=np.float64), H_counts[e])
+                        share_key = hf[0]   # (gate and up share the Hessian: factor it once)
+            elif dump is not None and len(t.shape) == 3:
+                mm = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", t.name)
+                if mm and dump.has(int(mm.group(1))):
+                    Ld = int(mm.group(1))
+                    hess = "dump blk.%d" % Ld
+                    if mm.group(2) == "down":
+                        def get_H(e, Ld=Ld):
+                            Wg = src_shards.dequant_expert("blk.%d.ffn_gate_exps.weight" % Ld, e)
+                            Wu = src_shards.dequant_expert("blk.%d.ffn_up_exps.weight" % Ld, e)
+                            return dump.hessian_mid(Ld, e, Wg, Wu, gated=hess_opt["gated"])
+                        share_key = None
+                    else:
+                        get_H = lambda e, Ld=Ld: dump.hessian_in(Ld, e, gated=hess_opt["gated"])
+                        share_key = "dump-in-%d" % Ld
             if hess is not None and (im is None or ne0 % ldlq.QK_K or new_type not in LDLQ_TYPES):
                 hess = None
-            if hess is not None:
-                H_all = np.load(hess[0], mmap_mode="r")
-                H_counts = np.load(hess[1])
-                if H_all.shape != (ne2, ne0, ne0):
-                    print("  %s: Hessian %s does not fit [%d x %d x %d]: plain rounding" % (t.name, H_all.shape, ne2, ne0, ne0))
-                    hess = None
             if hess is not None:
                 if new_type not in to_float:
                     to_float[new_type] = TO_FLOAT(lib.ggml_get_type_traits(int(new_type)).contents.to_float)
@@ -336,26 +420,54 @@ def main() -> int:
                     to_float[new_type](rawb.ctypes.data, f.ctypes.data, f.size)
                     return f
 
-                if hess_cache.get("file") != hess[0]:   # (gate and up share the Hessian: factor it once)
+                # from a dump, gate and up of one expert are done together (one factorization, no cache of 256 U's):
+                # the partner's bytes wait in `stash` until its own turn
+                partner = None
+                if dump is not None and hess.startswith("dump") and mm.group(2) in ("gate", "up"):
+                    pname = t.name.replace("ffn_gate_exps", "ffn_up_exps") if mm.group(2) == "gate" else t.name.replace("ffn_up_exps", "ffn_gate_exps")
+                    pplan = next((p for p in plan if p[0].name == pname and p[1] is not None), None)
+                    if pname in stash:
+                        pass   # (computed with the partner already)
+                    elif pplan is not None and pplan[1] == new_type:
+                        partner = (pname, pplan[2] // ne2)
+                        stash[pname] = np.empty((ne2, partner[1]), dtype=np.uint8)
+                if hess_cache.get("file") != share_key or share_key is None:
                     hess_cache.clear()
-                    hess_cache["file"] = hess[0]
+                    hess_cache["file"] = share_key
 
-                def one_ldlq(e):
-                    f32 = np.empty(ne1 * ne0, dtype=np.float32)
-                    to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
-                    W = f32.reshape(ne1, ne0)
-                    if e not in hess_cache:
-                        H = np.asarray(H_all[e], dtype=np.float64)
-                        hess_cache[e] = ldlq.prepare_hessian(H, H_counts[e], damp=hess_opt["damp"], order=hess_opt["order"])
-                    U, perm, diag_n, dead = hess_cache[e]
+                def factor(H, n):
+                    if dump is not None and dump_device != "numpy":
+                        return ldlq.prepare_hessian_torch(H, n, damp=hess_opt["damp"], order=hess_opt["order"], device=dump_device)
+                    return ldlq.prepare_hessian(H, n, damp=hess_opt["damp"], order=hess_opt["order"])
+
+                def ldlq_one_matrix(W, U, perm, diag_n, imrow):
                     if hess_opt["sub"] and new_type == Q.IQ2_XXS:
-                        out_b, deq, _ = ldlq.quantize_matrix_iq2xxs_sub(W, quant_blk, iq2xxs_tab, U, perm, im[e],
+                        out_b, deq, _ = ldlq.quantize_matrix_iq2xxs_sub(W, quant_blk, iq2xxs_tab, U, perm, imrow,
                                                                         sub=hess_opt["sub"], scale_search=hess_opt["scale_search"])
                     else:
                         out_b, deq, _ = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, U=U, perm=perm, diag_n=diag_n,
-                                                             imatrix=im[e], weights=hess_opt["weights"],
+                                                             imatrix=imrow, weights=hess_opt["weights"],
                                                              feedback=hess_opt["feedback"])
-                    dst[e] = out_b.reshape(-1)
+                    return out_b.reshape(-1)
+
+                def one_ldlq(e):
+                    if t.name in stash:
+                        dst[e] = stash[t.name][e]
+                        return per
+                    f32 = np.empty(ne1 * ne0, dtype=np.float32)
+                    to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
+                    W = f32.reshape(ne1, ne0)
+                    if share_key is not None and e in hess_cache:
+                        U, perm, diag_n, dead = hess_cache[e]
+                    else:
+                        H, n = get_H(e)
+                        U, perm, diag_n, dead = factor(H, n)
+                        if share_key is not None and partner is None:
+                            hess_cache[e] = (U, perm, diag_n, dead)
+                    dst[e] = ldlq_one_matrix(W, U, perm, diag_n, im[e])
+                    if partner is not None:
+                        Wp_ = src_shards.dequant_expert(partner[0], e)
+                        stash[partner[0]][e] = ldlq_one_matrix(Wp_, U, perm, diag_n, imat[partner[0]][e])
                     return per
 
             def one(e):
@@ -397,8 +509,9 @@ def main() -> int:
                         return 1
             w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne1, per // ne1)),
                                 tensor_endianess=r.endianess)
+            stash.pop(t.name, None)
             print("  %s -> %s in %.0f s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",
-                                                 " (ldlq %s)" % os.path.basename(hess[0]) if hess is not None else ""),
+                                                 " (ldlq %s)" % hess if hess is not None else ""),
                   flush=True)
         w.close()
     print("re-quantized %.2f GiB -> %.2f GiB%s" % (total_old / 2**30, total_new / 2**30, " (check only)" if check else ""))
