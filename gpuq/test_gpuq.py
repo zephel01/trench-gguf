@@ -1,9 +1,10 @@
 """gpuq/test_gpuq.py (trench-gguf) - the GPU quantizer (libgpuq.so) against ggml_quantize_chunk, byte for byte.
 
-    test_gpuq.py <gguf shard> <imatrix.gguf> [--tensor=<regex>] [--experts=N] [--types=iq2_xxs,iq2_s,iq1_s,iq1_m]
+    test_gpuq.py <gguf shard> <imatrix.gguf> [--tensor=<regex>] [--experts=N] [--types=iq1_s,iq1_m,...]
     test_gpuq.py --selftest [--types=...]      (no model files: random weights, a coarse 4-bit-like copy with many
                                                 equal values, and a random imatrix)
 
+Also checks reading the source on the GPU (gpuq_requantize: F16 / BF16 / Q8_0 / MXFP4 bytes -> IQ2_XXS).
 Takes the first tensor matching --tensor (an expert tensor, ne2 experts), dequantizes N experts with ggml's to_float,
 quantizes each to every type on the CPU (ggml) and on the GPU, and prints the share of identical blocks and the time.
 """
@@ -14,7 +15,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
-from requant_experts import LIBGGML, TO_FLOAT, TypeTraits, read_imatrix, gguf, np, Q  # noqa: E402
+from requant_experts import _env, LIBGGML, TO_FLOAT, TypeTraits, read_imatrix, gguf, np, Q  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -26,7 +27,7 @@ def main():
         shard, imat_path = [a for a in sys.argv[1:] if not a.startswith("--")]
     pat = re.compile(flags.get("--tensor", r"ffn_gate_exps"))
     n_exp = int(flags.get("--experts", "4"))
-    types = flags.get("--types", "iq2_xxs,iq2_s,iq1_s,iq1_m").split(",")
+    types = flags.get("--types", "iq1_s,iq1_m,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl").split(",")
 
     lib = ctypes.CDLL(LIBGGML)
     lib.ggml_quantize_chunk.restype = ctypes.c_size_t
@@ -35,12 +36,15 @@ def main():
     lib.ggml_get_type_traits.restype = ctypes.POINTER(TypeTraits)
     lib.ggml_get_type_traits.argtypes = [ctypes.c_int]
     lib.ggml_quantize_init.argtypes = [ctypes.c_int]
-    gq = ctypes.CDLL(os.path.join(HERE, os.environ.get("GPUQ_LIB", "libgpuq.so")))
+    gq = ctypes.CDLL(os.path.join(HERE, _env("GPUQ_LIB") or "libgpuq.so"))
     gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
     gq.gpuq_quantize.restype = ctypes.c_size_t
     gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
                                  ctypes.c_void_p]
     gq.gpuq_block_bytes.restype = ctypes.c_size_t
+    gq.gpuq_requantize.restype = ctypes.c_size_t
+    gq.gpuq_requantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64,
+                                   ctypes.c_int64, ctypes.c_void_p]
     rc = gq.gpuq_init(os.path.join(HERE, "gpuq_tables.bin").encode(), int(os.environ.get("GPUQ_DEVICE", "0")))
     assert rc == 0, "gpuq_init %d" % rc
 
@@ -80,7 +84,7 @@ def main():
         same = blocks = 0
         tc = tg = 0.0
         for e in range(n_exp):
-            nbytes = ne1 * (ne0 // 256) * bb
+            nbytes = ne1 * (ne0 // (32 if name == "iq4_nl" else 256)) * bb
             a = np.empty(nbytes, dtype=np.uint8)
             b = np.empty(nbytes, dtype=np.uint8)
             t0 = time.time()
@@ -101,6 +105,34 @@ def main():
         print("%-8s identical blocks %d / %d (%.4f%%)   cpu 1 thread %.2f s/expert, gpu %.3f s/expert (x%.0f)" %
               (name, same, blocks, 100.0 * same / blocks, tc / n_exp, tg / n_exp, tc / max(tg, 1e-9)))
         bad += blocks - same
+    # reading the source on the GPU (gpuq_requantize): the source bytes -> GPU floats -> IQ2_XXS, against ggml's
+    # to_float -> ggml_quantize_chunk. Self-test: the first matrix stored as each source type; a model: its own tensor.
+    if selftest:
+        srcs = []
+        for st in ("F16", "BF16", "Q8_0", "MXFP4"):
+            typ = Q[st]
+            tr = lib.ggml_get_type_traits(int(typ)).contents
+            enc = np.empty(ne1 * ne0 // tr.blck_size * tr.type_size, dtype=np.uint8)
+            lib.ggml_quantize_chunk(int(typ), xs[0].ctypes.data, enc.ctypes.data, 0, ne1, ne0, None)
+            srcs.append((st, typ, enc))
+    elif gq.gpuq_can_dequantize(int(t.tensor_type)) == 1:
+        srcs = [(t.tensor_type.name, t.tensor_type, raw[0])]
+    else:
+        srcs = []
+        print("%s: read on the CPU (gpuq_requantize does not take this type)" % t.tensor_type.name)
+    tq = Q.IQ2_XXS
+    bbq = gq.gpuq_block_bytes(int(tq))
+    for st, typ, enc in srcs:
+        f32 = np.empty(ne1 * ne0, dtype=np.float32)
+        TO_FLOAT(lib.ggml_get_type_traits(int(typ)).contents.to_float)(enc.ctypes.data, f32.ctypes.data, ne1 * ne0)
+        a = np.empty(ne1 * ne0 // 256 * bbq, dtype=np.uint8)
+        b = np.empty_like(a)
+        lib.ggml_quantize_chunk(int(tq), f32.ctypes.data, a.ctypes.data, 0, ne1, ne0, imv[0].ctypes.data)
+        got = gq.gpuq_requantize(int(typ), np.ascontiguousarray(enc).ctypes.data, int(tq), b.ctypes.data, ne1, ne0,
+                                 imv[0].ctypes.data)
+        diff = int((a.reshape(-1, bbq) != b.reshape(-1, bbq)).any(axis=1).sum()) if got == a.size else len(a) // bbq
+        print("%-8s read on the GPU -> iq2_xxs: %s" % (st.lower(), "identical" if diff == 0 else "%d blocks differ" % diff))
+        bad += diff
     print("OK: byte-identical to ggml" if bad == 0 else "MISMATCH: %d blocks differ" % bad)
     return 0 if bad == 0 else 1
 

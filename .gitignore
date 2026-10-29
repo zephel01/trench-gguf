@@ -7,3 +7,4 @@ third_party/
 .venv/
 trench.env
 setup-*.log
+tools/teacher

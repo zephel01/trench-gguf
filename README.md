@@ -35,14 +35,25 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
 
 ## ✨ Highlights
 
-- **Byte-identical to llama.cpp** — every block of IQ2_XXS / IQ2_S / IQ1_S / IQ1_M matches `ggml_quantize_chunk`
-  (checked on DeepSeek V4.1 experts and on random weights; a re-quantized GGUF layer is `cmp`-identical).
+- **Byte-identical to llama.cpp** — every block of IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S /
+  IQ4_XS / IQ4_NL matches `ggml_quantize_chunk` (checked on DeepSeek V4.1 experts and on random weights; a
+  re-quantized GGUF layer is `cmp`-identical).
+- **The source is read on the GPU too** — MXFP4 / Q8_0 / F16 / BF16 / F32 experts go to the GPU as they are stored
+  (1/8 to 1/2 of the bytes of floats) and are dequantized there, bit for bit as ggml does.
 - **5x a 32-thread CPU, 50-100x one thread** — one 384-expert tensor in about 5 s instead of 27 s.
 - **Re-quantize the experts only** — `tools/requant_experts.py` takes any GGUF ggml can read (MXFP4, i-quants,
   k-quants), re-quantizes the MoE experts per a regex rules file with an imatrix, and copies everything else as is.
+- **From the original weights in one go** — `tools/convert_hf.py` turns a Hugging Face model (safetensors, BF16 /
+  F16 / FP8) straight into a quantized GGUF with your rules, with no full-size intermediate file. It drives llama.cpp's
+  own converter, so a new architecture works as soon as llama.cpp converts it.
+- **Check the quality** — `tools/teacher` writes a reference (the top-32 log-probs of a big model) and prints KL, its
+  99th percentile and the same-top-token share of a quant against it, on the CPU or the GPU.
+- **Copy a published layout** — `tools/rules_from_gguf.py` reads the expert types of any GGUF (unsloth's, ISTA's ...)
+  into a rules file, optionally a step smaller or larger, so you can re-make that layout from the original.
 - **Mix two GGUFs per layer** — `tools/merge_experts.py` builds a GGUF set whose expert layers come from one of two
   sets, byte for byte, so the file you publish is exactly the mix you measured.
-- **One setup script** — `./setup.sh` fetches llama.cpp, builds only `libggml-base`, finds your GPU, builds the
+- **One setup script** — `./setup.sh` fetches llama.cpp, builds `libggml-base` and a patched GPU build (llama-imatrix,
+  the quality check), finds your GPU, builds the
   library and runs a self-test against ggml.
 - **ROCm and CUDA from one source.**
 
@@ -52,7 +63,7 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
 cd ~
 git clone https://github.com/zephel01/trench-gguf
 cd trench-gguf
-./setup.sh                 # llama.cpp, libggml-base, the GPU library, a Python venv, the self-test
+./setup.sh                 # llama.cpp (2 builds), the GPU library, a Python venv, the self-test: 20-40 min the first time
 source ~/trench-gguf/trench.env    # in every new terminal
 ```
 
@@ -61,6 +72,7 @@ source ~/trench-gguf/trench.env    # in every new terminal
 | Option | What it does |
 | --- | --- |
 | `--llama <folder>`, `--llama-build <folder>` | use a llama.cpp you already have |
+| `--llama-gpu-build <folder>` | use a ROCm/CUDA build of llama.cpp you already have (without the patch, the GPU imatrix of a model bigger than RAM stalls) |
 | `--backend hip\|cuda`, `--arch gfx1201\|sm_120` | override the GPU detection |
 | `--ref <git ref>` | pin llama.cpp |
 
@@ -72,7 +84,8 @@ source ~/trench-gguf/trench.env    # in every new terminal
 | git, cmake, a C compiler, Python 3 with venv | Ubuntu's |
 | ROCm (`hipcc`, `rocminfo`) **or** CUDA (`nvcc`, `nvidia-smi`) | HIP 7.15 (ROCm 10 / TheRock); CUDA 13.3 builds |
 | a GPU | AI PRO R9700 (gfx1201); RTX 50 (sm_120) needs CUDA 12.8 or later |
-| GPU memory | a few hundred MB |
+| GPU memory | a few hundred MB (quantizing); the dense part of the model plus a few GB (imatrix, quality check on the GPU) |
+| disk for the tool | about 3 GB (llama.cpp twice 1.2 GB, the Python venv with torch for the CPU 1.3 GB) |
 
 ### What the machine needs
 
@@ -239,9 +252,68 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
 
 - Start from the most precise file you have: the source's rounding error adds to the new one. unsloth's UD-Q4_K_XL
   of DeepSeek V4.1 keeps the experts as the released MXFP4, so nothing is lost before the re-quantization.
-- `--gpu` runs IQ2_XXS / IQ2_S / IQ1_S / IQ1_M on the GPU (`--gpu=1` for GPU 1); other types stay on the CPU.
-  Lines ending in `(gpu)` ran on the GPU.
+- `--gpu` runs IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL on the GPU (`--gpu=1`
+  for GPU 1); other types (k-quants) stay on the CPU. Lines ending in `(gpu)` ran entirely on the GPU; `(gpu quant,
+  cpu dequant)` means the source type (a k-quant or an i-quant) was dequantized on the CPU first.
 - `--check` prints the plan and the sizes without writing.
+
+### Convert a Hugging Face model (no GGUF published yet)
+
+```bash
+python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-Q8_0.gguf --outtype=q8_0 --split-max-size=50G
+python tools/imatrix.py calib calib.txt
+python tools/imatrix.py run ~/gguf/NewModel-Q8_0-00001-of-00004.gguf calib.txt ~/gguf/NewModel.imatrix.gguf
+python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=newmodel.rules \
+       --imatrix=~/gguf/NewModel.imatrix.gguf --gpu --split-max-size=50G
+```
+
+1. A first GGUF to make the imatrix from (Q8_0 is about half the size of BF16; when even that does not fit, give the
+   experts `iq4_xs` in a rules file: it needs no imatrix).
+2. The imatrix, from that file.
+3. The final GGUF, from the original weights again (no rounding added twice). Then delete the first one.
+
+Tensors no rule names get `--outtype` (llama.cpp's converter keeps norms, routers and the like in F32). The i-quants
+are quantized on the GPU with `--gpu`, the rest through ggml; the result is byte-identical to converting to BF16 and
+running `requant_experts.py` (checked on a small Qwen3-MoE model). It needs torch, transformers and sentencepiece,
+which `./setup.sh` installs.
+
+### Check the quality against a reference
+
+```bash
+tools/teacher ref ~/gguf/NewModel-Q8_0-00001-of-00004.gguf ref/ seq0.ids seq1.ids --gpu
+tools/teacher kl  ~/gguf/NewModel-IQ2-00001-of-00002.gguf  ref/ seq0.ids seq1.ids --gpu
+```
+
+`seqN.ids` are comma-separated token ids (`llama-tokenize -m <model> -f text.txt --ids`). `ref` writes `ref/seqN.topk`
+(the top-32 log-probs of every position, the format Abyss reads as `STRATA_GLM_SCORE_TOPK`); `kl` prints, for
+example:
+
+```text
+all: 3,996 positions, nll 1.61822 | KL 0.141051 (99th pct 1.2410, max 5.8211), same top token 87.31%
+```
+
+The KL is over the reference's top 32 plus one bucket for the rest of the vocabulary, as in Abyss. `--gpu` keeps the
+experts in RAM (mapped from the file) and runs the rest on the GPU; without it everything runs on the CPU. Qwen3.8
+UD-IQ4_XS, 628 tokens: 30.4 s on the CPU, 12.5 s with `--gpu`.
+
+### Copy a published layout
+
+```bash
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf > ud-iq2xxs.rules
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --shift=-1 > ud-iq2xxs-minus1.rules
+```
+
+One exact-name rule per expert tensor, then a summary, e.g. for unsloth's V4.1 UD-IQ2_XXS (only the headers are read,
+a few seconds):
+
+```text
+# 120 tensors: IQ1_M 33, IQ1_S 20, IQ2_S 15, IQ2_XS 45, IQ2_XXS 6, Q2_K 1
+# in this file: 146.11 GiB, with the shift: 129.99 GiB
+```
+
+`--shift=N` moves every expert tensor N steps on IQ1_S < IQ1_M < IQ2_XXS < IQ2_XS < IQ2_S < IQ3_XXS < IQ3_S < IQ4_XS
+(other types stay). `--sizes=<source shard 1>` adds what the experts would weigh when applied to that source. Feed
+the file to `requant_experts.py` as the rules file.
 
 ### Mix two GGUF sets per layer
 
@@ -288,20 +360,20 @@ About half of the GPU's time is the float weights crossing PCIe.
 
 ## ⚠️ Limits
 
-- **Types**: IQ2_XXS, IQ2_S, IQ1_S, IQ1_M on the GPU. IQ2_XS and IQ3_XXS are next; other types (and the IQ4_NL
-  fallback) run on the CPU through ggml.
+- **Types**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL on the GPU; the k-quants (Q2_K ...
+  Q6_K) run on the CPU through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
 - **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
 - **CUDA**: builds, but the match has not been checked on an NVIDIA GPU yet.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;
   on Windows, MSVC's `qsort` may order ties differently. The self-test tells.
 - **llama.cpp version**: ported from bed0a8566 and re-checked on ac8e1694d. Older llama.cpp searches IQ1_M another
-  way. After an update, run the self-test.
+  way (a January 2026 libggml-base in /usr/local/lib gave 2 other IQ1_M blocks in 6,912). The tools take
+  `libggml-base.so` from `LIBGGML` or `trench.env`, never from the library path. After an update, run the self-test.
 - **An imatrix is required** (as in llama.cpp for the IQ1/IQ2 types). A tensor the imatrix has no data for is quantized
   without one when its type allows it, and left as is for the IQ1/IQ2 types.
 
 ## 🗺️ Roadmap
 
-- IQ2_XS and IQ3_XXS on the GPU
 - the CUDA match on an RTX 5090
 - overlap the PCIe copies with the kernels
 - a faster CPU path that stays byte-identical (the codebook search in SIMD lanes), for machines without a GPU

@@ -18,9 +18,11 @@ Q6_K -> Q8_0, F16 when even that does not fit).  A tensor the imatrix has no dat
 quantized without one when the type allows it; the very low-bit types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S) need it,
 as in llama-quantize, so such a tensor is left as is - give it a rule of its own with another type (iq4_xs, q4_k ...).
 
---gpu quantizes IQ2_XXS / IQ2_S / IQ1_S / IQ1_M on the GPU with gpuq/libgpuq.so (ggml's quantizers line for line:
-byte-identical output, checked by gpuq/test_gpuq.py); the dequantizing stays on the CPU threads, other types stay on
-the CPU.  GPUQ_LIB picks the library (libgpuq_cuda.so for CUDA), GPUQ_DIR its folder.
+--gpu quantizes IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL on the GPU with
+gpuq/libgpuq.so (ggml's quantizers line for line: byte-identical output, checked by gpuq/test_gpuq.py); sources in
+F32 / F16 / BF16 / Q8_0 / MXFP4 are dequantized on the GPU as well (others on the CPU threads); other target types, and
+tensors without imatrix data, stay on the CPU.  GPUQ_LIB picks the library (libgpuq_cuda.so for CUDA), GPUQ_DIR its
+folder.
 
 Environment: GGUF_PY = llama.cpp/gguf-py (default: the installed gguf package), LIBGGML = <llama.cpp build>/bin/
 libggml-base.so (the CPU quantizer, and the reference the GPU output matches).
@@ -40,7 +42,22 @@ import numpy as np  # noqa: E402
 import gguf  # noqa: E402
 from gguf import GGMLQuantizationType as Q  # noqa: E402
 
-LIBGGML = os.environ.get("LIBGGML", "libggml-base.so")   # <llama.cpp build>/bin/libggml-base.so
+def _env(name):
+    """name from the environment, else from trench.env (written by setup.sh) - never a libggml-base.so of another
+    version found on the library path (a system one gave other IQ1_M bytes)"""
+    if os.environ.get(name):
+        return os.environ[name]
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trench.env")
+    if os.path.exists(p):
+        for line in open(p):
+            if line.startswith("export %s=" % name):
+                return line.split("=", 1)[1].strip()
+    return None
+
+
+LIBGGML = _env("LIBGGML")   # <llama.cpp build>/bin/libggml-base.so
+if not LIBGGML:
+    sys.exit("LIBGGML is not set and there is no trench.env: run ./setup.sh, or export LIBGGML=<llama.cpp build>/bin/libggml-base.so")
 
 
 class TypeTraits(ctypes.Structure):
@@ -117,12 +134,15 @@ def main() -> int:
     gq_lock = threading.Lock()
     if gpu is not None:
         here = os.environ.get("GPUQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpuq"))
-        gq = ctypes.CDLL(os.path.join(here, os.environ.get("GPUQ_LIB", "libgpuq.so")))   # (CUDA: libgpuq_cuda.so)
+        gq = ctypes.CDLL(os.path.join(here, _env("GPUQ_LIB") or "libgpuq.so"))   # (CUDA: libgpuq_cuda.so)
         gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
         gq.gpuq_quantize.restype = ctypes.c_size_t
         gq.gpuq_quantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
                                      ctypes.c_void_p]
         gq.gpuq_block_bytes.restype = ctypes.c_size_t
+        gq.gpuq_requantize.restype = ctypes.c_size_t
+        gq.gpuq_requantize.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64,
+                                       ctypes.c_int64, ctypes.c_void_p]
         rc = gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(gpu.split("=", 1)[1]) if "=" in gpu else 0)
         if rc != 0:
             print("gpuq_init failed (%d)" % rc)
@@ -226,15 +246,20 @@ def main() -> int:
             dst = np.empty((ne2, per), dtype=np.uint8)
             im = imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
 
-            on_gpu = gq is not None and gq.gpuq_block_bytes(int(new_type)) > 0
+            on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
+            gpu_dq = on_gpu and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
 
             def one(e):
+                if gpu_dq:
+                    with gq_lock:
+                        return gq.gpuq_requantize(int(src), raw[e].ctypes.data, int(new_type), dst[e].ctypes.data, ne1,
+                                                  ne0, im[e].ctypes.data)
                 f32 = np.empty(ne1 * ne0, dtype=np.float32)
                 to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
                 if on_gpu:
                     with gq_lock:
                         return gq.gpuq_quantize(int(new_type), f32.ctypes.data, dst[e].ctypes.data, ne1, ne0,
-                                                im[e].ctypes.data)   # (the GPU types all have an imatrix here)
+                                                im[e].ctypes.data)
                 got = lib.ggml_quantize_chunk(int(new_type), f32.ctypes.data, dst[e].ctypes.data, 0, ne1, ne0,
                                               None if im is None else im[e].ctypes.data)
                 return got
@@ -245,7 +270,7 @@ def main() -> int:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
             w.write_tensor_data(dst.reshape(ne2, ne1, per // ne1), tensor_endianess=r.endianess)
-            print("  %s -> %s in %.0f s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if on_gpu else ""),
+            print("  %s -> %s in %.0f s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else ""),
                   flush=True)
         w.close()
     print("re-quantized %.2f GiB -> %.2f GiB%s" % (total_old / 2**30, total_new / 2**30, " (check only)" if check else ""))

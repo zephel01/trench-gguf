@@ -39,7 +39,7 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
 ## ✨ 特長
 
 - **llama.cpp とバイト単位で同じ**
-  - IQ2_XXS / IQ2_S / IQ1_S / IQ1_M のすべてのブロックが、`ggml_quantize_chunk` の出力と一致します。
+  - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL のすべてのブロックが、`ggml_quantize_chunk` の出力と一致します。
   - DeepSeek V4.1 のエキスパートと、乱数の重みで確かめました。
   - 1 層を量子化し直した GGUF も、`cmp` でまったく同じでした。
 - **CPU 32 スレッドの 5 倍、1 スレッドの 50〜100 倍**
@@ -48,12 +48,23 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
   - 元にできるのは、ggml が読める GGUF なら何でもかまいません（MXFP4、i-quant、k-quant）。
   - 正規表現の規則ファイルに従い、imatrix を使って MoE のエキスパートだけを量子化し直します。
   - それ以外のテンソルはそのままコピーします。
+- **元の重みも GPU で読む**
+  - MXFP4 / Q8_0 / F16 / BF16 / F32 のエキスパートは、ファイルに入っている形のまま GPU に送り、GPU で float に戻します。
+  - PCIe を通る量が float の 1/8〜1/2 になります。戻した値は、ggml と 1 ビットまで同じです。
+- **元の重みから 1 回で作る（`tools/convert_hf.py`）**
+  - Hugging Face のモデル（safetensors、BF16 / F16 / FP8）から、規則どおり量子化した GGUF を直接作ります。元と同じ大きさの途中ファイルは作りません。
+  - llama.cpp 自身の変換スクリプトを呼び出すので、llama.cpp が新しいモデルに対応したその日から使えます。
+- **品質を確かめる（`tools/teacher`）**
+  - 大きいモデルの答え（各位置の上位 32 個の対数確率）を基準として書き出し、量子化版の KL、その上位 1%、1 位の一致率を出します。CPU でも GPU でも動きます。
+- **公開されている割り振りを写す（`tools/rules_from_gguf.py`）**
+  - どの GGUF からでも（unsloth、ISTA など）、エキスパートの型の割り振りを規則ファイルとして読み出します。
+  - 1 段小さく・大きくずらすこともできます。元のモデルから、同じ割り振りを自分で作り直せます。
 - **2 つの GGUF を層ごとに組み合わせる（`tools/merge_experts.py`）**
   - 層ごとに、どちらかの GGUF のエキスパートをバイト単位でそのまま使います。
   - 公開するファイルが、測った組み合わせとまったく同じになります。
 - **セットアップは 1 本**
   - `./setup.sh` だけで準備が終わります。
-  - llama.cpp の取得、`libggml-base` だけのビルド、GPU の判別、ライブラリのビルド、ggml との一致の自己テストまで行います。
+  - llama.cpp の取得、`libggml-base` と直しを当てた GPU 版（llama-imatrix、品質チェック用）のビルド、GPU の判別、ライブラリのビルド、ggml との一致の自己テストまで行います。初回は 20〜40 分かかります。
 - **ROCm と CUDA を同じソースから**ビルドできます。
 
 ## 🚀 はじめかた
@@ -62,7 +73,7 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
 cd ~
 git clone https://github.com/zephel01/trench-gguf
 cd trench-gguf
-./setup.sh                 # llama.cpp、libggml-base、GPU 用ライブラリ、Python の venv、自己テスト
+./setup.sh                 # llama.cpp（2 種類のビルド）、GPU 用ライブラリ、Python の venv、自己テスト。初回 20〜40 分
 source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 ```
 
@@ -73,6 +84,7 @@ source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 | オプション | 内容 |
 | --- | --- |
 | `--llama <フォルダ>`、`--llama-build <フォルダ>` | 手元にある llama.cpp を使う |
+| `--llama-gpu-build <フォルダ>` | 手元にある ROCm / CUDA 版の llama.cpp を使う（直しが無いと、メモリより大きいモデルの GPU での imatrix が止まります） |
 | `--backend hip\|cuda`、`--arch gfx1201\|sm_120` | GPU の自動判別を上書きする |
 | `--ref <git の ref>` | llama.cpp の版を固定する |
 
@@ -84,7 +96,8 @@ source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 | git、cmake、C コンパイラ、venv が使える Python 3 | Ubuntu 標準のもの |
 | ROCm（`hipcc`、`rocminfo`）**または** CUDA（`nvcc`、`nvidia-smi`） | HIP 7.15（ROCm 10 / TheRock）。CUDA 13.3 はビルドのみ |
 | GPU | AI PRO R9700（gfx1201）。RTX 50 系（sm_120）は CUDA 12.8 以降 |
-| GPU のメモリ | 数百 MB |
+| GPU のメモリ | 数百 MB（量子化）。imatrix と GPU での品質チェックは、モデルの密な部分 + 数 GB |
+| ツールのディスク | 約 3 GB（llama.cpp 2 つで 1.2 GB、CPU 版 torch 入りの Python venv で 1.3 GB） |
 
 ### マシンに必要なもの
 
@@ -255,10 +268,66 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
   - 元のファイルの丸め誤差に、新しい量子化の誤差が重なります。
   - たとえば DeepSeek V4.1 なら、unsloth の UD-Q4_K_XL のエキスパートは配布元の MXFP4 そのままです。量子化し直す前に失われるものがありません。
 - **`--gpu`**
-  - IQ2_XXS / IQ2_S / IQ1_S / IQ1_M を GPU で計算します。2 枚目の GPU を使うときは `--gpu=1` です。
-  - それ以外の型は CPU で計算します。
-  - ログの行末に `(gpu)` と付いたものが、GPU で計算したテンソルです。
+  - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL を GPU で計算します。2 枚目の GPU を使うときは `--gpu=1` です。
+  - それ以外の型（k-quant）は CPU で計算します。
+  - ログの行末に `(gpu)` と付いたものは、元の重みを読むところから全部 GPU で計算したテンソルです。
+  - `(gpu quant, cpu dequant)` は、元の型（k-quant や i-quant）を CPU で float に戻してから、GPU で量子化したものです。
 - **`--check`**：書き出さずに、計画と大きさだけを表示します。
+
+### Hugging Face のモデルを変換する（GGUF がまだ公開されていないとき）
+
+```bash
+python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-Q8_0.gguf --outtype=q8_0 --split-max-size=50G
+python tools/imatrix.py calib calib.txt
+python tools/imatrix.py run ~/gguf/NewModel-Q8_0-00001-of-00004.gguf calib.txt ~/gguf/NewModel.imatrix.gguf
+python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=newmodel.rules \
+       --imatrix=~/gguf/NewModel.imatrix.gguf --gpu --split-max-size=50G
+```
+
+1. imatrix を作るための 1 つ目の GGUF を作ります。Q8_0 なら BF16 の約半分です。それでも SSD に入らないときは、規則ファイルでエキスパートを `iq4_xs` にします（imatrix が要りません）。
+2. そのファイルで imatrix を作ります。
+3. 元の重みからもう一度、最終の GGUF を作ります（丸めが 2 回重なりません）。終わったら 1 つ目は消してかまいません。
+
+- 規則に書いていないテンソルは `--outtype` の型になります（ノルムやルーターなどは、llama.cpp の変換スクリプトが F32 のまま残します）。
+- `--gpu` を付けると i-quant は GPU で、それ以外は ggml で量子化します。
+- 結果は、いったん BF16 の GGUF にしてから `requant_experts.py` で量子化したものと、バイト単位で同じです（小さな Qwen3-MoE のモデルで確かめました）。
+- torch、transformers、sentencepiece が要ります。`./setup.sh` が入れます。
+
+### 基準と比べて品質を確かめる
+
+```bash
+tools/teacher ref ~/gguf/NewModel-Q8_0-00001-of-00004.gguf ref/ seq0.ids seq1.ids --gpu
+tools/teacher kl  ~/gguf/NewModel-IQ2-00001-of-00002.gguf  ref/ seq0.ids seq1.ids --gpu
+```
+
+- `seqN.ids` は、カンマ区切りのトークン番号です（`llama-tokenize -m <モデル> -f text.txt --ids` で作れます）。
+- `ref` は `ref/seqN.topk` を書きます。各位置の上位 32 個の対数確率で、Abyss の `STRATA_GLM_SCORE_TOPK` と同じ形式です。
+- `kl` は、たとえば次のように出します。
+
+```text
+all: 3,996 positions, nll 1.61822 | KL 0.141051 (99th pct 1.2410, max 5.8211), same top token 87.31%
+```
+
+- KL は、基準の上位 32 個と「それ以外の全部」をひとまとめにした 1 個で計算します（Abyss と同じ式）。
+- `--gpu` は、エキスパートをメモリ（ファイルを写したもの）に置いたまま、それ以外を GPU で計算します。付けないと全部 CPU で計算します。Qwen3.8 UD-IQ4_XS の 628 トークンで、CPU 30.4 秒、GPU 12.5 秒でした。
+
+### 公開されている割り振りを写す
+
+```bash
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf > ud-iq2xxs.rules
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf --shift=-1 > ud-iq2xxs-minus1.rules
+```
+
+エキスパートのテンソル 1 本につき 1 行（名前そのままの規則）を書き、最後にまとめを出します。読むのは各ファイルの頭だけで、数秒で終わります。unsloth の V4.1 UD-IQ2_XXS では、次のようになりました。
+
+```text
+# 120 tensors: IQ1_M 33, IQ1_S 20, IQ2_S 15, IQ2_XS 45, IQ2_XXS 6, Q2_K 1
+# in this file: 146.11 GiB, with the shift: 129.99 GiB
+```
+
+- `--shift=N`：エキスパートの型を、IQ1_S < IQ1_M < IQ2_XXS < IQ2_XS < IQ2_S < IQ3_XXS < IQ3_S < IQ4_XS の順に N 段ずらします（-1 で小さく、+1 で良く）。この並びにない型はそのままです。
+- `--sizes=<元のモデルの 1 つ目のファイル>`：その元のモデルに当てはめたときの、エキスパートの大きさも出します。
+- できたファイルを、`requant_experts.py` の規則ファイルとして渡します。
 
 ### 2 つの GGUF を層ごとに組み合わせる
 
@@ -310,7 +379,7 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
 ## ⚠️ 制限
 
-- **型**：GPU で計算するのは IQ2_XXS、IQ2_S、IQ1_S、IQ1_M です。IQ2_XS と IQ3_XXS が次の予定です。それ以外の型（代わりの型の IQ4_NL も）は、ggml を通して CPU で計算します。
+- **型**：GPU で計算するのは IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL です。k-quant（Q2_K〜Q6_K）は、ggml を通して CPU で計算します。元の重みを GPU で float に戻せるのは、F32、F16、BF16、Q8_0、MXFP4 です。
 - **モデル**：MoE のエキスパートだけが対象です。代わりの型になるテンソルとその理由は、[対応するモデル](#-対応するモデル)を見てください。
 - **CUDA**：ビルドはできますが、NVIDIA の GPU での一致はまだ確かめていません。
 - **環境**：確かめたのは x86-64 の Linux だけです。
@@ -319,13 +388,13 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
   - どちらも、自己テストで分かります。
 - **llama.cpp の版**：
   - bed0a8566 から写し、ac8e1694d でも確かめ直しました。
-  - それより古い llama.cpp は、IQ1_M の探索のやり方が違います。
+  - それより古い llama.cpp は、IQ1_M の探索のやり方が違います（/usr/local/lib にあった 2026 年 1 月の libggml-base では、IQ1_M の 6,912 ブロック中 2 ブロックが違いました）。
+  - ツールは `libggml-base.so` を、`LIBGGML` か `trench.env` から取ります。システムのライブラリの検索パスからは取りません。
   - 更新したら、自己テストを流してください。
 - **imatrix が必須**です（llama.cpp でも、IQ1/IQ2 系では必須です）。imatrix にデータのないテンソルは、imatrix が要らない型なら imatrix なしで作り、IQ1/IQ2 系なら元のまま残します。
 
 ## 🗺️ 今後の予定
 
-- IQ2_XS と IQ3_XXS の GPU 版
 - RTX 5090 での CUDA 版の一致の確認
 - PCIe の転送と GPU の計算を重ねる
 - GPU がない人向けに、ggml と一致したまま CPU 版を速くする（符号帳の探索を SIMD のレーンで並べる）
