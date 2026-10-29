@@ -9,7 +9,7 @@
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
-![Version](https://img.shields.io/badge/version-0.2.0-555)
+![Version](https://img.shields.io/badge/version-0.2.1-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 [English](README.md) · **日本語**
@@ -289,6 +289,19 @@ python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=ne
 2. そのファイルで imatrix を作ります。
 3. 元の重みからもう一度、最終の GGUF を作ります（丸めが 2 回重なりません）。終わったら 1 つ目は消してかまいません。
 
+調整用の文章を大きくする方法と、各エキスパートに何トークン届いたかの確かめ方です。
+
+```bash
+python tools/imatrix.py calib calib-1m.txt --size=small --scale=7     # 約 14.6 万トークンの代わりに約 100 万トークン
+python tools/imatrix.py stats ~/gguf/NewModel.imatrix.gguf
+```
+
+`stats` は、たとえば DeepSeek V4 Flash 0731（エキスパート 256 個、1 トークンに 6 個）の約 14.6 万トークンの imatrix で、次のように出します。
+
+```text
+imatrix-v4-0731.gguf: 129 expert tensors, 33024 experts; tokens per expert min 16, 1st pct 297, median 2692; under 1,000: 3114 (9.4%)
+```
+
 - 規則に書いていないテンソルは `--outtype` の型になります（ノルムやルーターなどは、llama.cpp の変換スクリプトが F32 のまま残します）。
 - `--gpu` を付けると i-quant は GPU で、それ以外は ggml で量子化します。
 - 結果は、いったん BF16 の GGUF にしてから `requant_experts.py` で量子化したものと、バイト単位で同じです（小さな Qwen3-MoE のモデルで確かめました）。
@@ -303,10 +316,10 @@ tools/teacher kl  ~/gguf/NewModel-IQ2-00001-of-00002.gguf  ref/ seq0.ids seq1.id
 
 - `seqN.ids` は、カンマ区切りのトークン番号です（`llama-tokenize -m <モデル> -f text.txt --ids` で作れます）。
 - `ref` は `ref/seqN.topk` を書きます。各位置の上位 32 個の対数確率で、Abyss の `STRATA_GLM_SCORE_TOPK` と同じ形式です。
-- `kl` は、たとえば次のように出します。
+- `kl` は、たとえば次のように出します（DeepSeek V4 Flash 0731 を unsloth UD-IQ1_S と同じ型で作り、UD-Q8_K_XL を基準に 1,024 トークン × 8 本で測ったもの）。
 
 ```text
-all: 3,996 positions, nll 1.61822 | KL 0.141051 (99th pct 1.2410, max 5.8211), same top token 87.31%
+all: 8183 positions, nll 2.47236 | KL 0.284858 (99th pct 3.0088, max 10.8833), same top token 76.61%
 ```
 
 - KL は、基準の上位 32 個と「それ以外の全部」をひとまとめにした 1 個で計算します（Abyss と同じ式）。

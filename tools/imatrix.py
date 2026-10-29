@@ -2,11 +2,16 @@
 llama.cpp's llama-imatrix with the flags that work for MoE models bigger than RAM, then the sha256 of the result.
 
 usage:
-  imatrix.py calib <out.txt> [--dataset-dir=<dir>]
-      Downloads eaddario/imatrix-calibration at revision REVISION (MIT; only the *_micro files of PLAN) into
+  imatrix.py calib <out.txt> [--dataset-dir=<dir>] [--size=micro|tiny|small|medium] [--scale=N]
+      Downloads eaddario/imatrix-calibration at revision REVISION (MIT; only the files of PLAN, *_<size>) into
       --dataset-dir (default: ./imatrix-calibration) and writes the text: from each file, whole lines from the start
       until the section reaches its byte budget, the sections in PLAN's order. The text does not depend on the model
       (byte budgets, not token budgets): the same revision gives the same bytes on every machine.
+      --size picks the dataset files (default micro), --scale multiplies every budget (default 1): --size=small
+      --scale=7 gives ~1M tokens on DeepSeek's tokenizer (the default ~146K leaves 9% of DeepSeek V4's 11,008 experts
+      under 1,000 tokens).
+  imatrix.py stats <imatrix.gguf>
+      Tokens per expert (from the counts): min, 1st percentile, median, and how many experts got under 1,000.
   imatrix.py run <model shard 1> <calib.txt> <out imatrix.gguf> [--llama-bin=<dir with llama-imatrix>] [--gpu[=<device>]]
                  [--threads=N] [--chunks=N] [--ub=N] [--dry-run]
       --ub: tokens per GPU batch (default 8192; 16384 with the patched llama.cpp is the fastest measured, below).
@@ -48,17 +53,20 @@ def sha256(path):
     return h.hexdigest()
 
 
-def calib(out, ddir):
+def calib(out, ddir, size="micro", scale=1):
     import pyarrow.parquet as pq
     ddir.mkdir(parents=True, exist_ok=True)
-    need = [f"{n}.parquet" for n, _ in PLAN if not (ddir / f"{n}.parquet").exists()]
+    plan = [(n.replace("_micro", "_" + size), b * scale) for n, b in PLAN]
+    need = [f"{n}.parquet" for n, _ in plan if not (ddir / f"{n}.parquet").exists()]
     if need:
         from huggingface_hub import hf_hub_download
         for n in need:
             hf_hub_download(REPO, n, repo_type="dataset", revision=REVISION, local_dir=str(ddir))
     parts = []
-    for name, budget in PLAN:
+    for name, budget in plan:
         text = pq.read_table(ddir / f"{name}.parquet").column("content")[0].as_py()
+        if len(text.encode("utf-8")) < budget:
+            sys.exit(f"{name} has {len(text.encode('utf-8'))} bytes, fewer than its budget {budget}: pick a bigger --size")
         lines, size = [], 0
         for line in text.split("\n"):
             if size >= budget:
@@ -102,11 +110,29 @@ def run(model, text, out, flags):
     print(f"{out}: sha256 {sha256(out)}")
 
 
+def stats(path):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from requant_experts import gguf, np
+    per = []
+    for t in gguf.GGUFReader(path).tensors:
+        if t.name.endswith(".counts") and "_exps" in t.name and int(np.prod(t.shape)) > 1:
+            per.append(np.asarray(t.data, dtype=np.float64).reshape(-1))
+    if not per:
+        sys.exit("no per-expert counts in " + path)
+    c = np.concatenate(per)
+    print(f"{path}: {len(per)} expert tensors, {len(c)} experts; tokens per expert min {c.min():.0f}, "
+          f"1st pct {np.percentile(c, 1):.0f}, median {np.median(c):.0f}; under 1,000: {(c < 1000).sum()} "
+          f"({100 * (c < 1000).mean():.1f}%)")
+
+
 def main():
     flags = dict((a.split("=", 1) + [""])[:2] for a in sys.argv[1:] if a.startswith("--"))
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) == 2 and args[0] == "calib":
-        calib(Path(args[1]), Path(flags.get("--dataset-dir") or "imatrix-calibration"))
+        calib(Path(args[1]), Path(flags.get("--dataset-dir") or "imatrix-calibration"), flags.get("--size") or "micro",
+              int(flags.get("--scale") or 1))
+    elif len(args) == 2 and args[0] == "stats":
+        stats(args[1])
     elif len(args) == 4 and args[0] == "run" and (flags.get("--llama-bin") or os.environ.get("LLAMA_BIN")):
         run(args[1], args[2], args[3], flags)
     else:

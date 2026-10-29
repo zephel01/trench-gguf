@@ -9,7 +9,7 @@
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
-![Version](https://img.shields.io/badge/version-0.2.0-555)
+![Version](https://img.shields.io/badge/version-0.2.1-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 **English** · [日本語](README.ja.md)
@@ -273,6 +273,19 @@ python tools/convert_hf.py ~/models/NewModel ~/gguf/NewModel-IQ2.gguf --rules=ne
 2. The imatrix, from that file.
 3. The final GGUF, from the original weights again (no rounding added twice). Then delete the first one.
 
+A bigger calibration text and a check of how many tokens each expert got:
+
+```bash
+python tools/imatrix.py calib calib-1m.txt --size=small --scale=7     # ~1M tokens instead of ~146K
+python tools/imatrix.py stats ~/gguf/NewModel.imatrix.gguf
+```
+
+`stats` prints, e.g. for the ~146K-token imatrix of DeepSeek V4 Flash 0731 (256 experts, 6 a token):
+
+```text
+imatrix-v4-0731.gguf: 129 expert tensors, 33024 experts; tokens per expert min 16, 1st pct 297, median 2692; under 1,000: 3114 (9.4%)
+```
+
 Tensors no rule names get `--outtype` (llama.cpp's converter keeps norms, routers and the like in F32). The i-quants
 are quantized on the GPU with `--gpu`, the rest through ggml; the result is byte-identical to converting to BF16 and
 running `requant_experts.py` (checked on a small Qwen3-MoE model). It needs torch, transformers and sentencepiece,
@@ -286,11 +299,11 @@ tools/teacher kl  ~/gguf/NewModel-IQ2-00001-of-00002.gguf  ref/ seq0.ids seq1.id
 ```
 
 `seqN.ids` are comma-separated token ids (`llama-tokenize -m <model> -f text.txt --ids`). `ref` writes `ref/seqN.topk`
-(the top-32 log-probs of every position, the format Abyss reads as `STRATA_GLM_SCORE_TOPK`); `kl` prints, for
-example:
+(the top-32 log-probs of every position, the format Abyss reads as `STRATA_GLM_SCORE_TOPK`); `kl` prints, e.g. for
+DeepSeek V4 Flash 0731 with unsloth UD-IQ1_S's types (8 sequences of 1,024 tokens against UD-Q8_K_XL):
 
 ```text
-all: 3,996 positions, nll 1.61822 | KL 0.141051 (99th pct 1.2410, max 5.8211), same top token 87.31%
+all: 8183 positions, nll 2.47236 | KL 0.284858 (99th pct 3.0088, max 10.8833), same top token 76.61%
 ```
 
 The KL is over the reference's top 32 plus one bucket for the rest of the vocabulary, as in Abyss. `--gpu` keeps the

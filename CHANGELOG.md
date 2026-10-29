@@ -3,6 +3,14 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
+## v0.2.1 - 2026-10-30
+
+- `tools/imatrix.py calib --size=micro|tiny|small|medium --scale=N`: a bigger calibration text from the same pinned
+  dataset (`--size=small --scale=7`: 4,239,316 bytes, ~1M tokens on DeepSeek's tokenizer).
+- `tools/imatrix.py stats <imatrix.gguf>`: tokens per expert (min, 1st percentile, median, how many under 1,000). The
+  ~146K-token imatrix of DeepSeek V4 Flash 0731 leaves 9.4% of its experts under 1,000 tokens.
+- README: the `teacher kl` example is a real run now (DeepSeek V4 Flash 0731).
+
 ## v0.2.0 - 2026-10-29
 
 **More types on the GPU, the source read on the GPU, Hugging Face conversion, imatrix on the GPU, a quality check.**
