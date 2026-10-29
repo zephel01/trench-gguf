@@ -151,6 +151,7 @@ def main() -> int:
                 "gated": "--gated" in flags, "feedback": "--no-feedback" not in flags,
                 "sub": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--sub=")), 0)),
                 "scale_search": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--scale-search=")), 0))}
+    hess_cache = {}
     if hess_dir:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import ldlq
@@ -326,12 +327,18 @@ def main() -> int:
                     to_float[new_type](rawb.ctypes.data, f.ctypes.data, f.size)
                     return f
 
+                if hess_cache.get("file") != hess[0]:   # (gate and up share the Hessian: factor it once)
+                    hess_cache.clear()
+                    hess_cache["file"] = hess[0]
+
                 def one_ldlq(e):
                     f32 = np.empty(ne1 * ne0, dtype=np.float32)
                     to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
                     W = f32.reshape(ne1, ne0)
-                    H = np.asarray(H_all[e], dtype=np.float64)
-                    U, perm, diag_n, dead = ldlq.prepare_hessian(H, H_counts[e], damp=hess_opt["damp"], order=hess_opt["order"])
+                    if e not in hess_cache:
+                        H = np.asarray(H_all[e], dtype=np.float64)
+                        hess_cache[e] = ldlq.prepare_hessian(H, H_counts[e], damp=hess_opt["damp"], order=hess_opt["order"])
+                    U, perm, diag_n, dead = hess_cache[e]
                     if hess_opt["sub"] and new_type == Q.IQ2_XXS:
                         out_b, deq, _ = ldlq.quantize_matrix_iq2xxs_sub(W, quant_blk, iq2xxs_tab, U, perm, im[e],
                                                                         sub=hess_opt["sub"], scale_search=hess_opt["scale_search"])
