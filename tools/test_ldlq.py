@@ -70,13 +70,26 @@ def main():
         Ua, perma, diag_a, _ = ldlq.prepare_hessian(H, n, damp=0.01, order="act")
         fba, deq_fba, _ = ldlq.quantize_matrix(W, quant, dequant, tsize, U=Ua, perm=perma, diag_n=diag_a,
                                                imatrix=imatrix, weights="schur", feedback=True)
+        extra = ""
+        if typ == Q.IQ2_XXS:
+            tab = ldlq.IQ2XXS(to_float)
+            for sub, ss in ((32, 0), (8, 0), (32, 2)):
+                t1 = time.time()
+                sb, deq_sb, _ = ldlq.quantize_matrix_iq2xxs_sub(W, quant, tab, U, perm, imatrix, sub=sub, scale_search=ss)
+                to_float(sb.ctypes.data, full.ctypes.data, full.size)
+                ok &= np.array_equal(full, deq_sb)
+                extra += "; sub%d%s %.5g (%+.1f%%, dequant matches %s, %.1f s)" % (
+                    sub, "+ss%d" % ss if ss else "", ldlq.proxy_loss(W, deq_sb, H, n),
+                    100 * (ldlq.proxy_loss(W, deq_sb, H, n) / ldlq.proxy_loss(W, deq_plain, H, n) - 1),
+                    np.array_equal(full, deq_sb), time.time() - t1)
+            # the no-feedback sub path must reproduce ggml's own choice up to the grid mismatch: just report it
         lp = ldlq.proxy_loss(W, deq_plain, H, n)
         lf = ldlq.proxy_loss(W, deq_fb, H, n)
         la = ldlq.proxy_loss(W, deq_fba, H, n)
         print("%-8s plain bytes == ggml whole-row: %s; dequant matches: %s / %s; proxy loss plain %.5g, feedback %.5g "
               "(%+.1f%%), act+schur %.5g (%+.1f%%), %.1f s" % (
                   typ.name.lower(), same, deq_same, fb_deq_same, lp, lf, 100 * (lf / lp - 1), la, 100 * (la / lp - 1),
-                  time.time() - t0))
+                  time.time() - t0) + extra)
         ok &= same and deq_same and fb_deq_same
     print("OK" if ok else "MISMATCH")
     return 0 if ok else 1

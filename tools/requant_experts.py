@@ -3,7 +3,8 @@ for byte. Rules may name 2-D tensors too (attention, shared experts, embeddings:
 the same way as one expert.
 
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
-                         [--gpu[=<device>]]
+                         [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--order=seq|act] [--weights=imatrix|diag|schur]
+                         [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
   rules file: one "<tensor name regex> <type>" a line (# comments), the first match wins, e.g.
       blk\\.(2[4-9]|30)\\.ffn_(gate|up)_exps\\.weight  iq3_xxs
       blk\\.\\d+\\.ffn_down_exps\\.weight             iq2_s
@@ -24,6 +25,18 @@ gpuq/libgpuq.so (ggml's quantizers line for line: byte-identical output, checked
 F32 / F16 / BF16 / Q8_0 / MXFP4 are dequantized on the GPU as well (others on the CPU threads); other target types, and
 tensors without imatrix data, stay on the CPU.  GPUQ_LIB picks the library (libgpuq_cuda.so for CUDA), GPUQ_DIR its
 folder.
+
+--hessian=<dir> turns on error-feedback rounding (tools/ldlq.py: GPTQ / block-LDLQ around ggml's own quantizer, the
+output stays the plain GGUF format) for the expert tensors the folder has a Hessian for: blk.L.in.npy [n_expert, ne0,
+ne0] for ffn_gate/up_exps, blk.L.mid.npy for ffn_down_exps, blk.L.counts.npy (tools/hessian_hf.py writes them;
+--gated takes the routing-weight-squared versions blk.L.in_g / mid_g). --damp is the ridge added to the Hessian as a
+share of its mean diagonal (GPTQ's 1%), --order=act quantizes the super-blocks in order of descending input energy,
+--weights picks the importance handed to ggml for each super-block (imatrix = the imatrix row as without --hessian;
+diag = diag(H)/n; schur = the conditional Hessian's diagonal), --no-feedback runs the same path without the error
+update (a check: the bytes must then equal the plain run). --sub=32 / 8 (IQ2_XXS only) runs the feedback every
+sub-block / codebook group inside the super-block with ggml's scales kept and the points chosen again against the
+inference grid; --scale-search=K also tries the 4-bit sub-block scales K steps around ggml's. Tensors without a Hessian
+file are quantized as before.
 
 Environment: GGUF_PY = llama.cpp/gguf-py (default: the installed gguf package), LIBGGML = <llama.cpp build>/bin/
 libggml-base.so (the CPU quantizer, and the reference the GPU output matches).
@@ -94,6 +107,20 @@ def fit_type(typ, ne0):
     return fb if ne0 % gguf.GGML_QUANT_SIZES[fb][0] == 0 else Q.F16
 
 
+LDLQ_TYPES = {Q.IQ1_S, Q.IQ1_M, Q.IQ2_XXS, Q.IQ2_XS, Q.IQ2_S, Q.IQ3_XXS, Q.IQ3_S, Q.IQ4_XS}   # super-block = 256
+
+
+def hess_file(hess_dir, name, gated):
+    """(Hessian .npy, counts .npy) for an expert tensor name, or None when the folder has none for it."""
+    m = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", name)
+    if m is None:
+        return None
+    kind = "mid" if m.group(2) == "down" else "in"
+    h = os.path.join(hess_dir, "blk.%s.%s%s.npy" % (m.group(1), kind, "_g" if gated else ""))
+    c = os.path.join(hess_dir, "blk.%s.counts.npy" % m.group(1))
+    return (h, c) if os.path.exists(h) and os.path.exists(c) else None
+
+
 def read_imatrix(path):
     r = gguf.GGUFReader(path)
     sums, counts = {}, {}
@@ -117,6 +144,16 @@ def main() -> int:
     imat_path = next((a.split("=", 1)[1] for a in flags if a.startswith("--imatrix=")), None)
     threads = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--threads=")), os.cpu_count() or 8))
     gpu = next((a for a in flags if a == "--gpu" or a.startswith("--gpu=")), None)
+    hess_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--hessian=")), None)
+    hess_opt = {"damp": float(next((a.split("=", 1)[1] for a in flags if a.startswith("--damp=")), 0.01)),
+                "order": next((a.split("=", 1)[1] for a in flags if a.startswith("--order=")), "seq"),
+                "weights": next((a.split("=", 1)[1] for a in flags if a.startswith("--weights=")), "imatrix"),
+                "gated": "--gated" in flags, "feedback": "--no-feedback" not in flags,
+                "sub": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--sub=")), 0)),
+                "scale_search": int(next((a.split("=", 1)[1] for a in flags if a.startswith("--scale-search=")), 0))}
+    if hess_dir:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import ldlq
     if len(args) != 3 or imat_path is None:
         print(__doc__)
         return 2
@@ -257,6 +294,54 @@ def main() -> int:
             on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
             gpu_dq = on_gpu and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
 
+            hess = hess_file(hess_dir, t.name, hess_opt["gated"]) if hess_dir and len(t.shape) == 3 else None
+            if hess is not None and (im is None or ne0 % ldlq.QK_K or new_type not in LDLQ_TYPES):
+                hess = None
+            if hess is not None:
+                H_all = np.load(hess[0], mmap_mode="r")
+                H_counts = np.load(hess[1])
+                if H_all.shape != (ne2, ne0, ne0):
+                    print("  %s: Hessian %s does not fit [%d x %d x %d]: plain rounding" % (t.name, H_all.shape, ne2, ne0, ne0))
+                    hess = None
+            if hess is not None:
+                if new_type not in to_float:
+                    to_float[new_type] = TO_FLOAT(lib.ggml_get_type_traits(int(new_type)).contents.to_float)
+                bs_q, tsize = gguf.GGML_QUANT_SIZES[new_type]
+                iq2xxs_tab = ldlq.IQ2XXS(to_float[new_type]) if hess_opt["sub"] and new_type == Q.IQ2_XXS else None
+
+                def quant_blk(blk, qw):
+                    rawb = np.empty((blk.shape[0], tsize), dtype=np.uint8)
+                    if on_gpu:
+                        with gq_lock:
+                            got = gq.gpuq_quantize(int(new_type), blk.ctypes.data, rawb.ctypes.data, blk.shape[0],
+                                                   blk.shape[1], qw.ctypes.data)
+                    else:
+                        got = lib.ggml_quantize_chunk(int(new_type), blk.ctypes.data, rawb.ctypes.data, 0, blk.shape[0],
+                                                      blk.shape[1], qw.ctypes.data)
+                    assert got == rawb.nbytes
+                    return rawb
+
+                def dequant_blk(rawb):
+                    f = np.empty((rawb.shape[0], bs_q), dtype=np.float32)
+                    to_float[new_type](rawb.ctypes.data, f.ctypes.data, f.size)
+                    return f
+
+                def one_ldlq(e):
+                    f32 = np.empty(ne1 * ne0, dtype=np.float32)
+                    to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
+                    W = f32.reshape(ne1, ne0)
+                    H = np.asarray(H_all[e], dtype=np.float64)
+                    U, perm, diag_n, dead = ldlq.prepare_hessian(H, H_counts[e], damp=hess_opt["damp"], order=hess_opt["order"])
+                    if hess_opt["sub"] and new_type == Q.IQ2_XXS:
+                        out_b, deq, _ = ldlq.quantize_matrix_iq2xxs_sub(W, quant_blk, iq2xxs_tab, U, perm, im[e],
+                                                                        sub=hess_opt["sub"], scale_search=hess_opt["scale_search"])
+                    else:
+                        out_b, deq, _ = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, U=U, perm=perm, diag_n=diag_n,
+                                                             imatrix=im[e], weights=hess_opt["weights"],
+                                                             feedback=hess_opt["feedback"])
+                    dst[e] = out_b.reshape(-1)
+                    return per
+
             def one(e):
                 if gpu_dq:
                     with gq_lock:
@@ -273,13 +358,14 @@ def main() -> int:
                 return got
 
             with concurrent.futures.ThreadPoolExecutor(threads) as ex:
-                for e, got in enumerate(ex.map(one, range(ne2))):
+                for e, got in enumerate(ex.map(one_ldlq if hess is not None else one, range(ne2))):
                     if got != per:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
             w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne1, per // ne1)),
                                 tensor_endianess=r.endianess)
-            print("  %s -> %s in %.0f s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else ""),
+            print("  %s -> %s in %.0f s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",
+                                                 " (ldlq %s)" % os.path.basename(hess[0]) if hess is not None else ""),
                   flush=True)
         w.close()
     print("re-quantized %.2f GiB -> %.2f GiB%s" % (total_old / 2**30, total_new / 2**30, " (check only)" if check else ""))

@@ -111,3 +111,162 @@ def proxy_loss(W, deq, H, n):
     """tr((W-Q) H (W-Q)^T) / n: the calibration-input squared output error, what the feedback minimizes."""
     D = (W - deq).astype(np.float64)
     return float(np.einsum("ij,jk,ik->", D, np.asarray(H, dtype=np.float64), D) / max(float(n), 1.0))
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Finer feedback for IQ2_XXS: ggml's quantizer fixes the super-block scale d (fp16) and the 4-bit sub-block scales;
+# with those kept, the 8-weight codebook points and signs of each 32-weight sub-block (or each group of 8) are chosen
+# again on the error-updated weights, against the values inference really produces (iq2xxs_grid: 8/25/43/59 x d x
+# (2l+1)/8, not the 1/3/5/7 the quantizer searches), and the error is pushed on before the next sub-block / group.
+# Optionally the 4-bit sub-block scale is searched too (per row; d stays).
+
+class IQ2XXS:
+    """Tables for the IQ2_XXS block format, recovered from ggml's own dequantizer (to_float)."""
+    TSIZE = 66
+
+    def __init__(self, to_float):
+        grid = np.zeros((256, 8), dtype=np.float32)
+        raw = np.zeros((256, self.TSIZE), dtype=np.uint8)
+        raw[:, 0:2] = np.frombuffer(np.float16(1.0).tobytes(), dtype=np.uint8)     # d = 1
+        q = np.zeros((256, 2), dtype=np.uint32)
+        q[:, 0] = np.arange(256)                      # grid index in group 0, signs 0
+        q[:, 1] = 3 << 28                             # l = 3: db = (0.5 + 3) * 0.25 = 0.875
+        raw[:, 2:10] = q.view(np.uint8)
+        f = np.empty((256, 256), dtype=np.float32)
+        to_float(raw.ctypes.data, f.ctypes.data, f.size)
+        grid = np.rint(f[:, :8] / 0.875).astype(np.float32)   # 8, 25, 43 or 59
+        assert set(np.unique(grid).tolist()) <= {8.0, 25.0, 43.0, 59.0}, np.unique(grid)
+        self.grid = grid
+        # sign index s (7 bits) -> 8-bit mask with even parity (ksigns_iq2xs)
+        s = np.arange(128, dtype=np.uint8)
+        par = np.array([bin(int(v)).count("1") & 1 for v in s], dtype=np.uint8)
+        self.ksigns = s | (par << 7)
+        self.signmask = np.array([(-1.0 if (self.ksigns[k] >> j) & 1 else 1.0) for k in range(128) for j in range(8)],
+                                 dtype=np.float32).reshape(128, 8)
+
+    def parse(self, raw):
+        """raw [ne1, 66] -> d [ne1] f32, ls [ne1, 8] int (the 4-bit sub-block scales)"""
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32).reshape(-1)
+        q = raw[:, 2:66].copy().view(np.uint32).reshape(-1, 8, 2)
+        ls = (q[:, :, 1] >> 28).astype(np.int64)
+        return d, ls
+
+    def best_points(self, x, w, db):
+        """x [ne1, 8g] weights of g groups of 8, w the same shape (importance), db [ne1] the sub-block's dequant
+        scale -> (grid idx [ne1, g] int, sign idx [ne1, g] int (7 bits), dequantized [ne1, 8g], cost [ne1])
+        Exhaustive over the 256 points; signs follow x, parity fixed by flipping the cheapest weight (as ggml)."""
+        ne1, n = x.shape
+        g = n // 8
+        xg = x.reshape(ne1, g, 1, 8)
+        wg = w.reshape(ne1, g, 1, 8)
+        v = (self.grid[None, None] * db[:, None, None, None])          # [ne1, 1, 256, 8] candidate magnitudes
+        ax = np.abs(xg)
+        err = wg * (ax - v) ** 2                                        # [ne1, g, 256, 8]
+        cost = err.sum(-1)
+        # parity: the product of the signs must be +1 (even number of minus signs); x < 0 gives the sign
+        neg = (xg < 0)
+        odd = (neg.sum(-1) & 1).astype(bool)                            # [ne1, g, 1]
+        flip_cost = 4 * wg * ax * v                                     # [ne1, g, 256, 8]
+        imin = flip_cost.argmin(-1)                                     # [ne1, g, 256]
+        add = np.take_along_axis(flip_cost, imin[..., None], -1)[..., 0]
+        cost = cost + np.where(odd, add, 0.0)
+        best = cost.argmin(-1)                                          # [ne1, g]
+        bc = np.take_along_axis(cost, best[..., None], -1)[..., 0]
+        # signs for the chosen point
+        sgn = np.where(neg[:, :, 0, :], -1.0, 1.0).astype(np.float32)   # [ne1, g, 8]
+        fl = np.take_along_axis(imin, best[..., None], -1)[..., 0]      # [ne1, g] the flipped position
+        oddg = odd[:, :, 0]
+        rows, cols = np.nonzero(oddg)
+        sgn[rows, cols, fl[rows, cols]] *= -1
+        vals = self.grid[best] * db[:, None, None]                     # [ne1, g, 8]
+        deq = (vals * sgn).reshape(ne1, n)
+        bits = (sgn < 0).astype(np.uint8)
+        s8 = (bits << np.arange(8, dtype=np.uint8)).sum(-1).astype(np.uint8)   # even parity -> low 7 bits = index
+        assert ((s8 >> 7) == np.array([bin(int(v)).count("1") & 1 for v in (s8 & 127).reshape(-1)]).reshape(s8.shape)).all()
+        return best, (s8 & 127).astype(np.int64), deq, bc.sum(-1)
+
+    def encode(self, d, ls, gidx, sidx):
+        """d [ne1], ls [ne1, 8], gidx [ne1, 8, 4], sidx [ne1, 8, 4] -> raw [ne1, 66]"""
+        ne1 = d.shape[0]
+        raw = np.zeros((ne1, self.TSIZE), dtype=np.uint8)
+        raw[:, 0:2] = d.astype(np.float16).view(np.uint8).reshape(ne1, 2)
+        q = np.zeros((ne1, 8, 2), dtype=np.uint32)
+        for k in range(4):
+            q[:, :, 0] |= (gidx[:, :, k].astype(np.uint32) << (8 * k))
+            q[:, :, 1] |= (sidx[:, :, k].astype(np.uint32) << (7 * k))
+        q[:, :, 1] |= (ls.astype(np.uint32) << 28)
+        raw[:, 2:66] = q.reshape(ne1, 16).view(np.uint8)
+        return raw
+
+
+def quantize_matrix_iq2xxs_sub(W, quant, tab, U, perm, imatrix, sub=32, scale_search=0, bs=QK_K):
+    """Like quantize_matrix for IQ2_XXS, but the feedback runs every `sub` columns (32 = sub-block, 8 = codebook
+    group) inside each super-block: ggml's pass fixes d and the sub-block scales, the points are chosen again on the
+    updated weights. scale_search=k also tries the 4-bit scales l-k..l+k per row (the best total cost wins).
+    Returns (bytes, dequantized W, stats)."""
+    ne1, ne0 = W.shape
+    nblk = ne0 // bs
+    tsize = tab.TSIZE
+    Wp = np.ascontiguousarray(W[:, perm], dtype=np.float32)
+    out = np.empty((ne1, nblk, tsize), dtype=np.uint8)
+    deq = np.empty((ne1, ne0), dtype=np.float32)
+    blk_order = perm.reshape(nblk, bs)[:, 0] // bs
+    nsub = bs // sub
+    for k in range(nblk):
+        cols = slice(k * bs, (k + 1) * bs)
+        qw = np.ascontiguousarray(imatrix[perm[cols]], dtype=np.float32)
+        blk = np.ascontiguousarray(Wp[:, cols])
+        raw = quant(blk, qw)                                   # ggml's pass: d and the sub-block scales
+        d, ls = tab.parse(raw)
+        sigma2 = (blk * blk).sum(1) / bs                       # (what ggml weights the search with)
+        weff = qw[None] * np.sqrt(sigma2[:, None] + blk * blk)
+        gidx = np.zeros((ne1, 8, 4), dtype=np.int64)
+        sidx = np.zeros((ne1, 8, 4), dtype=np.int64)
+        new_ls = ls.copy()
+        for j in range(nsub):
+            c0 = k * bs + j * sub
+            sc = slice(c0, c0 + sub)
+            x = np.ascontiguousarray(Wp[:, sc])
+            w = np.ascontiguousarray(weff[:, j * sub:(j + 1) * sub])
+            ib = (j * sub) // 32                                # the sub-block(s) these columns belong to
+            g0 = (j * sub) % 32 // 8
+            ng = sub // 8
+            if sub == 32:
+                cand = range(-scale_search, scale_search + 1)
+                bestc = None
+                for dl in cand:
+                    l_try = np.clip(ls[:, ib] + dl, 0, 15)
+                    db = d * (0.5 + l_try) * 0.25
+                    gi, si, dq, c = tab.best_points(x, w, db)
+                    if bestc is None:
+                        bestc, bl, bg, bsn, bd = c, l_try, gi, si, dq
+                    else:
+                        better = c < bestc
+                        bestc = np.where(better, c, bestc)
+                        bl = np.where(better, l_try, bl)
+                        bg = np.where(better[:, None], gi, bg)
+                        bsn = np.where(better[:, None], si, bsn)
+                        bd = np.where(better[:, None], dq, bd)
+                new_ls[:, ib] = bl
+                gidx[:, ib, :] = bg
+                sidx[:, ib, :] = bsn
+                q = bd
+            else:   # groups of 8 with the sub-block's scale as it is
+                db = d * (0.5 + new_ls[:, ib]) * 0.25
+                gi, si, q, _ = tab.best_points(x, w, db)
+                gidx[:, ib, g0:g0 + ng] = gi
+                sidx[:, ib, g0:g0 + ng] = si
+            zero = d == 0
+            if zero.any():                                      # (an all-zero super-block stays all zero)
+                q[zero] = 0
+                gidx[zero, ib] = 0
+                sidx[zero, ib] = 0
+            deq[:, perm[sc]] = q
+            if c0 + sub < ne0:
+                E = x - q
+                rest = slice(c0 + sub, ne0)
+                Es = np.linalg.solve(U[sc, sc].T, E.T).T
+                Wp[:, rest] -= (Es @ U[sc, rest]).astype(np.float32)
+        enc = tab.encode(d, new_ls, gidx, sidx)
+        out[:, blk_order[k], :] = enc
+    return out.reshape(ne1, nblk * tsize), deq, {}
