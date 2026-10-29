@@ -9,6 +9,7 @@
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
+![Version](https://img.shields.io/badge/version-0.2.0-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 [English](README.md) · **日本語**
@@ -328,6 +329,11 @@ python tools/rules_from_gguf.py ~/models/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XX
 - `--shift=N`：エキスパートの型を、IQ1_S < IQ1_M < IQ2_XXS < IQ2_XS < IQ2_S < IQ3_XXS < IQ3_S < IQ4_XS の順に N 段ずらします（-1 で小さく、+1 で良く）。この並びにない型はそのままです。
 - `--sizes=<元のモデルの 1 つ目のファイル>`：その元のモデルに当てはめたときの、エキスパートの大きさも出します。
 - できたファイルを、`requant_experts.py` の規則ファイルとして渡します。
+- `--all`：エキスパートだけでなく、全部のテンソルを書きます。規則には 2 次元のテンソル（attention、共有エキスパート、埋め込み）も書けます。attention が BF16 の元のモデル（unsloth の UD-Q8_K_XL）からでも、公開されているファイルと型も大きさも同じものが作れます。
+
+```bash
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ1_S/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf --all | grep -v " i32$" > v4-ud-iq1s-all.rules
+```
 
 ### 2 つの GGUF を層ごとに組み合わせる
 

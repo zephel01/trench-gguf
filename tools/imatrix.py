@@ -13,7 +13,8 @@ usage:
       --llama-bin defaults to $LLAMA_BIN (trench.env: setup.sh's GPU build of llama.cpp).
       --gpu: a ROCm or CUDA build of llama.cpp; the dense tensors go to the GPU (-ngl 99), the routed experts stay
       memory-mapped on the host (-ot exps=CPU) and llama.cpp pushes them to the GPU for each 8,192-token batch (its
-      op offload). Without --gpu: a CPU build. Both: -c 2048 -b 8192 -ub 8192, the whole text, --fit off.
+      op offload). Without --gpu: a CPU build. Both: -c 2048 -b 8192 -ub 8192, the whole text, --fit off, saved once at
+      the end.
       GGML_HIP_ENABLE_UNIFIED_MEMORY is removed from the environment: with it, a model bigger than RAM sat on one
       thread for 20 minutes (DeepSeek V4 Flash 0731, 150 GB on 94 GB). The run goes into its own systemd scope when
       systemd-run exists, with no memory cap: if the desktop's systemd-oomd steps in, it stops this scope, not the
@@ -79,7 +80,8 @@ def run(model, text, out, flags):
     threads = flags.get("--threads", str(min(16, os.cpu_count() or 8)))
     ub = flags.get("--ub") or "8192"
     cmd = [str(exe), "-m", model, "-f", text, "-o", out, "-c", "2048", "-b", ub, "-ub", ub,
-           "-t", threads, "-fit", "off"]
+           "-t", threads, "-fit", "off", "-ofreq", "100000"]   # (one save at the end: each save also computes
+    # per-tensor statistics on one thread, ~2.5 min for DeepSeek V4 Flash - 20 of 65 minutes went to saves every 10)
     env = {k: v for k, v in os.environ.items() if k != "GGML_HIP_ENABLE_UNIFIED_MEMORY"}
     if "--gpu" in flags:
         cmd += ["-ngl", "99", "-ot", "exps=CPU"]

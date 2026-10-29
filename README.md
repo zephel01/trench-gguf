@@ -9,6 +9,7 @@
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
 ![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
+![Version](https://img.shields.io/badge/version-0.2.0-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 **English** · [日本語](README.ja.md)
@@ -314,6 +315,13 @@ a few seconds):
 `--shift=N` moves every expert tensor N steps on IQ1_S < IQ1_M < IQ2_XXS < IQ2_XS < IQ2_S < IQ3_XXS < IQ3_S < IQ4_XS
 (other types stay). `--sizes=<source shard 1>` adds what the experts would weigh when applied to that source. Feed
 the file to `requant_experts.py` as the rules file.
+
+`--all` lists every tensor, not just the experts. Rules may name 2-D tensors (attention, shared experts, embeddings) as
+well, so a source with BF16 attention (unsloth's UD-Q8_K_XL) comes out at the published file's size, type for type:
+
+```bash
+python tools/rules_from_gguf.py ~/models/DeepSeek-V4-Flash-0731-GGUF/UD-IQ1_S/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf --all | grep -v " i32$" > v4-ud-iq1s-all.rules
+```
 
 ### Mix two GGUF sets per layer
 

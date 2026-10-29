@@ -1,5 +1,6 @@
 """Re-quantizes the routed experts of a (split) GGUF to smaller i-quants with an imatrix; copies everything else byte
-for byte.
+for byte. Rules may name 2-D tensors too (attention, shared experts, embeddings: e.g. BF16 -> Q8_0 / Q5_K), quantized
+the same way as one expert.
 
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
                          [--gpu[=<device>]]
@@ -178,13 +179,14 @@ def main() -> int:
         out = os.path.join(out_dir, os.path.basename(sh))
         print("%s -> %s" % (sh, out), flush=True)
         plan = []
+        no_im = set()
         for t in r.tensors:
             new_type = next((typ for pat, typ in rules if pat.search(t.name)), None)
-            if new_type is not None and len(t.shape) != 3:
-                print("  %s: not a 3-D expert tensor: left as is" % t.name)
+            if new_type is not None and len(t.shape) not in (2, 3):
+                print("  %s: not a matrix: left as is" % t.name)
                 new_type = None
             if new_type is not None:
-                ne0, ne1, ne2 = (int(x) for x in t.shape)
+                ne0, ne1, ne2 = (int(x) for x in t.shape) if len(t.shape) == 3 else (int(t.shape[0]), int(t.shape[1]), 1)
                 fit = fit_type(new_type, ne0)
                 if fit != new_type:
                     print("  %s: rows of %d do not fit %s: %s instead (llama-quantize's fallback)" % (
@@ -194,10 +196,15 @@ def main() -> int:
                     print("  %s: no imatrix data, which %s needs: left as is (give it a rule with another type)" % (
                         t.name, new_type.name))
                     new_type = None
-                elif t.name in imat and imat[t.name].shape != (ne2, ne0):
-                    print("  %s: imatrix %s does not fit [%d x %d experts]: left as is" % (
-                        t.name, imat[t.name].shape, ne0, ne2))
-                    new_type = None
+                elif t.name in imat and imat[t.name].shape != (ne2, ne0):   # (a 2-D tensor: one row)
+                    if new_type in NEEDS_IMATRIX:
+                        print("  %s: imatrix %s does not fit [%d x %d experts]: left as is" % (
+                            t.name, imat[t.name].shape, ne0, ne2))
+                        new_type = None
+                    else:   # (e.g. DeepSeek V4's grouped attn_output_a: the imatrix saw the 8 groups as one row)
+                        print("  %s: imatrix %s does not fit [%d x %d]: quantized without it" % (
+                            t.name, imat[t.name].shape, ne0, ne2))
+                        no_im.add(t.name)
             if new_type is not None and new_type == t.tensor_type:
                 new_type = None
             if new_type is None:
@@ -224,8 +231,9 @@ def main() -> int:
             w.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
         for t, new_type, nbytes in plan:
             if new_type is not None:
-                ne0, ne1, ne2 = (int(x) for x in t.shape)
-                w.add_tensor_info(t.name, (ne2, ne1, nbytes // (ne2 * ne1)), np.uint8, nbytes, raw_dtype=new_type)
+                ne1, ne2 = int(t.shape[1]), (int(t.shape[2]) if len(t.shape) == 3 else 1)
+                shape = (ne2, ne1, nbytes // (ne2 * ne1)) if len(t.shape) == 3 else (ne1, nbytes // ne1)
+                w.add_tensor_info(t.name, shape, np.uint8, nbytes, raw_dtype=new_type)
             else:
                 w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
         w.write_header_to_file()
@@ -236,7 +244,7 @@ def main() -> int:
             if new_type is None:
                 w.write_tensor_data(t.data, tensor_endianess=r.endianess)
                 continue
-            ne0, ne1, ne2 = (int(x) for x in t.shape)
+            ne0, ne1, ne2 = (int(x) for x in t.shape) if len(t.shape) == 3 else (int(t.shape[0]), int(t.shape[1]), 1)
             src = t.tensor_type
             if src not in to_float:
                 to_float[src] = TO_FLOAT(lib.ggml_get_type_traits(int(src)).contents.to_float)
@@ -244,7 +252,7 @@ def main() -> int:
             raw = np.ascontiguousarray(np.asarray(t.data).reshape(ne2, -1))
             per = nbytes // ne2
             dst = np.empty((ne2, per), dtype=np.uint8)
-            im = imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
+            im = None if t.name in no_im else imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
 
             on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
             gpu_dq = on_gpu and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
@@ -269,7 +277,8 @@ def main() -> int:
                     if got != per:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
-            w.write_tensor_data(dst.reshape(ne2, ne1, per // ne1), tensor_endianess=r.endianess)
+            w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne1, per // ne1)),
+                                tensor_endianess=r.endianess)
             print("  %s -> %s in %.0f s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else ""),
                   flush=True)
         w.close()
