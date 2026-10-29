@@ -121,6 +121,15 @@ def hess_file(hess_dir, name, gated):
     return (h, c) if os.path.exists(h) and os.path.exists(c) else None
 
 
+_FORK_FN = None
+_FORK_DST = None
+
+
+def _fork_call(e):
+    got = _FORK_FN(e)
+    return got, _FORK_DST(e)
+
+
 def read_imatrix(path):
     r = gguf.GGUFReader(path)
     sums, counts = {}, {}
@@ -364,8 +373,25 @@ def main() -> int:
                                               None if im is None else im[e].ctypes.data)
                 return got
 
+            if hess is not None and hess_opt["sub"]:
+                # the sub-block search is many small numpy ops (GIL-bound): processes instead of threads (fork: the
+                # closures, the mapped source and the ggml library are inherited; a child returns its expert's bytes)
+                import multiprocessing
+                global _FORK_FN
+                _FORK_FN = one_ldlq
+                global _FORK_DST
+                _FORK_DST = lambda e: dst[e].tobytes()
+                with multiprocessing.get_context("fork").Pool(threads) as pool:
+                    for e, (got, b) in enumerate(pool.imap(_fork_call, range(ne2))):
+                        if got != per:
+                            print("quantizer wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
+                            return 1
+                        dst[e] = np.frombuffer(b, dtype=np.uint8)
+                ex_map = []
+            else:
+                ex_map = None
             with concurrent.futures.ThreadPoolExecutor(threads) as ex:
-                for e, got in enumerate(ex.map(one_ldlq if hess is not None else one, range(ne2))):
+                for e, got in enumerate(ex_map if ex_map is not None else ex.map(one_ldlq if hess is not None else one, range(ne2))):
                     if got != per:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
