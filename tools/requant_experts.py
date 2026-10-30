@@ -3,7 +3,7 @@ for byte. Rules may name 2-D tensors too (attention, shared experts, embeddings:
 the same way as one expert.
 
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
-                         [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--order=seq|act] [--weights=imatrix|diag|schur]
+                         [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--damp-iq1=D] [--order=seq|act] [--weights=imatrix|diag|schur]
                          [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
                          [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]]
   rules file: one "<tensor name regex> <type>" a line (# comments), the first match wins, e.g.
@@ -31,7 +31,8 @@ folder.
 output stays the plain GGUF format) for the expert tensors the folder has a Hessian for: blk.L.in.npy [n_expert, ne0,
 ne0] for ffn_gate/up_exps, blk.L.mid.npy for ffn_down_exps, blk.L.counts.npy (tools/hessian_hf.py writes them;
 --gated takes the routing-weight-squared versions blk.L.in_g / mid_g). --damp is the ridge added to the Hessian as a
-share of its mean diagonal (GPTQ's 1%), --order=act quantizes the super-blocks in order of descending input energy,
+share of its mean diagonal (GPTQ's 1%; on OLMoE 0.3 beat 0.1 for IQ2_XXS and 1.0 beat 0.3 for IQ1_S / IQ1_M), --damp-iq1
+overrides it for the IQ1_S / IQ1_M tensors, --order=act quantizes the super-blocks in order of descending input energy,
 --weights picks the importance handed to ggml for each super-block (imatrix = the imatrix row as without --hessian;
 diag = diag(H)/n; schur = the conditional Hessian's diagonal), --no-feedback runs the same path without the error
 update (a check: the bytes must then equal the plain run). --sub=32 / 8 (IQ2_XXS only) runs the feedback every
@@ -210,6 +211,7 @@ def main() -> int:
     gpu = next((a for a in flags if a == "--gpu" or a.startswith("--gpu=")), None)
     hess_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--hessian=")), None)
     hess_opt = {"damp": float(next((a.split("=", 1)[1] for a in flags if a.startswith("--damp=")), 0.01)),
+                "damp_iq1": next((float(a.split("=", 1)[1]) for a in flags if a.startswith("--damp-iq1=")), None),
                 "order": next((a.split("=", 1)[1] for a in flags if a.startswith("--order=")), "seq"),
                 "weights": next((a.split("=", 1)[1] for a in flags if a.startswith("--weights=")), "imatrix"),
                 "gated": "--gated" in flags, "feedback": "--no-feedback" not in flags,
@@ -436,10 +438,12 @@ def main() -> int:
                     hess_cache.clear()
                     hess_cache["file"] = share_key
 
+                damp_t = hess_opt["damp_iq1"] if hess_opt["damp_iq1"] is not None and new_type in (Q.IQ1_S, Q.IQ1_M) else hess_opt["damp"]
+
                 def factor(H, n):
                     if dump is not None and dump_device != "numpy":
-                        return ldlq.prepare_hessian_torch(H, n, damp=hess_opt["damp"], order=hess_opt["order"], device=dump_device)
-                    return ldlq.prepare_hessian(H, n, damp=hess_opt["damp"], order=hess_opt["order"])
+                        return ldlq.prepare_hessian_torch(H, n, damp=damp_t, order=hess_opt["order"], device=dump_device)
+                    return ldlq.prepare_hessian(H, n, damp=damp_t, order=hess_opt["order"])
 
                 def ldlq_one_matrix(W, U, perm, diag_n, imrow):
                     if hess_opt["sub"] and new_type == Q.IQ2_XXS:
