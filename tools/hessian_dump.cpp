@@ -56,7 +56,10 @@ struct Dump {
 };
 
 static int layer_of(const char * name, const char * kind) {
-    // "blk.12.ffn_gate_exps.weight" (possibly with a " (view)" suffix) -> 12 when kind matches, else -1
+    // "blk.12.ffn_gate_exps.weight" -> 12 when kind matches, else -1. The scheduler's copy of a weight to another
+    // backend (op offload of the host experts to the GPU) is named "<backend>#blk.12....#<n>": look inside the '#'s.
+    const char * h = strchr(name, '#');
+    if (h) name = h + 1;
     if (strncmp(name, "blk.", 4)) return -1;
     char * end;
     long L = strtol(name + 4, &end, 10);
@@ -71,10 +74,16 @@ static void get_tensor(const ggml_tensor * t, std::vector<char> & buf) {
 
 static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
     Dump & d = *(Dump *) ud;
+    static std::map<std::string, int> seen;
+    static const bool debug = getenv("HESSIAN_DUMP_DEBUG") != nullptr;
     if (ask) {
         if (t->op == GGML_OP_MUL_MAT_ID) {
             const int Lg = layer_of(t->src[0]->name, "ffn_gate_exps"), Ld = d.down ? layer_of(t->src[0]->name, "ffn_down_exps") : -1;
             const int L = Lg >= 0 ? Lg : Ld;
+            if (debug && seen[t->src[0]->name]++ == 0)
+                fprintf(stderr, "mul_mat_id src0 '%s' src1 [%ld %ld %ld] %s ids [%ld %ld] -> layer %d %s\n", t->src[0]->name,
+                        (long) t->src[1]->ne[0], (long) t->src[1]->ne[1], (long) t->src[1]->ne[2], ggml_type_name(t->src[1]->type),
+                        (long) t->src[2]->ne[0], (long) t->src[2]->ne[1], L, L >= d.lo && L <= d.hi ? "DUMP" : "skip");
             return L >= d.lo && L <= d.hi;
         }
         if (!strncmp(t->name, "ffn_moe_weights", 15)) {   // ffn_moe_weights-L, _norm-L, _scaled-L ...
@@ -92,11 +101,16 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
         const int L = atoi(dash + 1);
         if (d.wname[L] != t->name || t->type != GGML_TYPE_F32) return true;
         get_tensor(t, d.buf);
-        const int64_t n_ids = t->ne[1], n_tok = t->ne[2];
+        const bool lead1 = t->ne[0] == 1;   // [1, n_ids, n_tok] (llama.cpp's weights) or [n_ids, n_tok]
+        const int64_t n_ids = lead1 ? t->ne[1] : t->ne[0], n_tok = lead1 ? t->ne[2] : t->ne[1];
+        const size_t nb_j = lead1 ? t->nb[1] : t->nb[0], nb_r = lead1 ? t->nb[2] : t->nb[1];
+        if (debug && seen[t->name]++ == 0)
+            fprintf(stderr, "weights '%s' [%ld %ld %ld %ld] %s\n", t->name, (long) t->ne[0], (long) t->ne[1], (long) t->ne[2],
+                    (long) t->ne[3], ggml_type_name(t->type));
         std::vector<float> w(n_ids * n_tok);
         for (int64_t r = 0; r < n_tok; ++r)
             for (int64_t j = 0; j < n_ids; ++j)
-                w[r * n_ids + j] = *(const float *) (d.buf.data() + r * t->nb[2] + j * t->nb[1]);
+                w[r * n_ids + j] = *(const float *) (d.buf.data() + r * nb_r + j * nb_j);
         fwrite(w.data(), 4, w.size(), d.file("blk." + std::to_string(L) + ".w.f32"));
         return true;
     }
@@ -196,7 +210,7 @@ int main(int argc, char ** argv) {
                 const int i = b.n_tokens++;
                 b.token[i] = tokens[(size_t) (c0 + s) * n_ctx + k]; b.pos[i] = k; b.n_seq_id[i] = 1; b.seq_id[i][0] = s; b.logits[i] = 0;
             }
-        if (llama_decode(ctx, b)) { fprintf(stderr, "decode failed at chunk %d\n", c0); return 1; }
+        if (llama_decode(ctx, b)) { fprintf(stderr, "decode failed at chunk %d\n", c0); fflush(stderr); return 1; }
         printf("chunks %d-%d of %d done\n", c0, c0 + ns - 1, n_chunk);
         fflush(stdout);
     }
