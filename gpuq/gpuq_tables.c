@@ -4,7 +4,8 @@
 //   ./gpuq_tables gpuq_tables.bin
 // File: per type (IQ2_XXS, IQ2_XS, IQ1_S, IQ2_S, then IQ3_XXS and IQ3_S from iq3xs_init_impl): int32 ggml type,
 // grid_size, map_size, neigh_len, then uint64 grid[grid_size] (IQ3's uint32 points zero-extended), int32 map[map_size],
-// uint16 neighbours[neigh_len].
+// uint16 neighbours[neigh_len]. Then the dequantizer's grids (ggml-common.h's iq*_grid) as type 1000 + ggml type with
+// map_size = neigh_len = 0 (for gpuq_dequantize_dev; an older libgpuq.so skips them).
 #include "ggml-quants.c"
 
 static void dump(FILE * f, enum ggml_type type) {
@@ -50,6 +51,18 @@ static void dump3(FILE * f, enum ggml_type type, int grid_size) {
     fprintf(stderr, "type %d: grid %d, map %d, neighbours %d\n", (int) type, grid_size, map_size, neigh_len);
 }
 
+// the dequantizer's tables (ggml-common.h's iq*_grid, what ggml's to_float reads) as pseudo-type 1000 + ggml type:
+// uint64 points (the IQ3 uint32 points zero-extended), no map, no neighbours
+static void dump_dq(FILE * f, enum ggml_type type, const void * grid, int n, int width) {
+    const int32_t hdr[4] = {1000 + (int32_t) type, n, 0, 0};
+    fwrite(hdr, sizeof(hdr), 1, f);
+    for (int i = 0; i < n; ++i) {
+        const uint64_t v = width == 8 ? ((const uint64_t *) grid)[i] : (uint64_t) ((const uint32_t *) grid)[i];
+        fwrite(&v, sizeof(v), 1, f);
+    }
+    fprintf(stderr, "dequant type %d: grid %d\n", (int) type, n);
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { fprintf(stderr, "usage: %s out.bin\n", argv[0]); return 2; }
     FILE * f = fopen(argv[1], "wb");
@@ -60,6 +73,12 @@ int main(int argc, char ** argv) {
     dump(f, GGML_TYPE_IQ2_S);
     dump3(f, GGML_TYPE_IQ3_XXS, 256);
     dump3(f, GGML_TYPE_IQ3_S, 512);
+    dump_dq(f, GGML_TYPE_IQ2_XXS, iq2xxs_grid, 256, 8);
+    dump_dq(f, GGML_TYPE_IQ2_XS, iq2xs_grid, 512, 8);
+    dump_dq(f, GGML_TYPE_IQ2_S, iq2s_grid, 1024, 8);
+    dump_dq(f, GGML_TYPE_IQ3_XXS, iq3xxs_grid, 256, 4);
+    dump_dq(f, GGML_TYPE_IQ3_S, iq3s_grid, 512, 4);
+    dump_dq(f, GGML_TYPE_IQ1_S, iq1s_grid, NGRID_IQ1S, 8);
     fclose(f);
     return 0;
 }

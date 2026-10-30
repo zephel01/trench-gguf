@@ -10,6 +10,11 @@
 //         -o libgpuq_cuda.so      (-fmad=false: nvcc contracts a*b+c into FMA by default, ggml-base does not)
 // C API (ctypes): gpuq_init(tables, device) -> 0; gpuq_quantize(type, src f32, dst, nrow, n_per_row, imatrix) ->
 // bytes written (0 on error); host pointers; the imatrix holds n_per_row weights (as ggml_quantize_chunk's).
+// Device-pointer API (for a caller that keeps the weights on the GPU, e.g. torch: tools/ldlq.py's GPU loop), all on
+// the caller's stream, no synchronization: gpuq_quantize_dev(type, d_x, d_dst, nblocks, d_qw, qw_mod, qw_div, stream)
+// quantizes nblocks super-blocks, block b taking the 256 importance weights d_qw + ((b % qw_mod) / qw_div) * 256;
+// gpuq_dequantize_dev(type, d_q, d_out, nblocks, stream) is ggml's to_float of those types on the GPU (bit for bit);
+// gpuq_dequantize_src_dev(src, d_raw, d_out, n, stream) reads F32/F16/BF16/Q8_0/MXFP4 source bytes.
 #if defined(__CUDACC__) && !defined(__HIP__)
 #include <cuda_runtime.h>
 #define hipSuccess cudaSuccess
@@ -21,6 +26,7 @@
 #define hipMemcpyDeviceToHost cudaMemcpyDeviceToHost
 #define hipGetLastError cudaGetLastError
 #define hipDeviceSynchronize cudaDeviceSynchronize
+#define hipStream_t cudaStream_t
 #else
 #include <hip/hip_runtime.h>
 #endif
@@ -1388,11 +1394,192 @@ QD void q_iq4_nl(const float * xbl, const float * qwbl, block_iq4_nl * y, Tab) {
 }
 
 // ---------------------------------------------------------------- kernels and the C API
+QD float fp16_to_fp32(uint16_t h);
 template <typename B, void (*Q)(const float *, const float *, B *, Tab), int BS = QK_K>
-__global__ void kq(const float * x, const float * qw, B * y, int64_t nblocks, int64_t nb_row, Tab t) {
+__global__ void kq(const float * x, const float * qw, B * y, int64_t nblocks, int64_t qw_mod, int64_t qw_div, Tab t) {
     const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
-    Q(x + b*BS, qw + (b % nb_row)*BS, y + b, t);
+    Q(x + b*BS, qw + ((b % qw_mod) / qw_div)*BS, y + b, t);
+}
+
+// ---------------------------------------------------------------- ggml's dequantizers (dequantize_row_iq*: ggml-quants.c)
+// one thread a super-block; the grids are ggml-common.h's (gpuq_tables.bin, type 1000 + ggml type); ksigns_iq2xs[k] =
+// k with its parity in bit 7, kmask_iq2xs[j] = 1 << j. Only multiplies and adds in ggml's order: bit-identical in fp32.
+struct DqTab { const uint64_t * grid; };
+
+QD uint8_t ksigns(uint32_t k) { return (uint8_t) (k | ((__popc(k) & 1) << 7)); }
+QD float sgn8(uint8_t signs, int j) { return (signs >> j) & 1 ? -1.f : 1.f; }
+
+QD void dq_iq2_xxs(const block_iq2_xxs * x, float * y, DqTab t) {
+    const float d = fp16_to_fp32(x->d);
+    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+        uint32_t aux32[2];
+        memcpy(aux32, x->qs + 4*ib32, 2*sizeof(uint32_t));
+        const uint8_t * aux8 = (const uint8_t *) aux32;
+        const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *) (t.grid + aux8[l]);
+            const uint8_t signs = ksigns((aux32[1] >> 7*l) & 127);
+            for (int j = 0; j < 8; ++j) y[j] = db * grid[j] * sgn8(signs, j);
+            y += 8;
+        }
+    }
+}
+QD void dq_iq2_xs(const block_iq2_xs * x, float * y, DqTab t) {
+    const float d = fp16_to_fp32(x->d);
+    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+        float db[2];
+        db[0] = d * (0.5f + (x->scales[ib32] & 0xf)) * 0.25f;
+        db[1] = d * (0.5f + (x->scales[ib32] >>  4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid = (const uint8_t *) (t.grid + (x->qs[4*ib32 + l] & 511));
+            const uint8_t signs = ksigns(x->qs[4*ib32 + l] >> 9);
+            for (int j = 0; j < 8; ++j) y[j] = db[l/2] * grid[j] * sgn8(signs, j);
+            y += 8;
+        }
+    }
+}
+QD void dq_iq2_s(const block_iq2_s * x, float * y, DqTab t) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t * qs = x->qs;
+    const uint8_t * qh = x->qh;
+    const uint8_t * signs = qs + QK_K/8;
+    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+        float db[2];
+        db[0] = d * (0.5f + (x->scales[ib32] & 0xf)) * 0.25f;
+        db[1] = d * (0.5f + (x->scales[ib32] >>  4)) * 0.25f;
+        for (int l = 0; l < 4; ++l) {
+            const float dl = db[l/2];
+            const uint8_t * grid = (const uint8_t *) (t.grid + (qs[l] | (qh[ib32] << (8-2*l) & 0x300)));
+            for (int j = 0; j < 8; ++j) y[j] = dl * grid[j] * sgn8(signs[l], j);
+            y += 8;
+        }
+        qs += 4;
+        signs += 4;
+    }
+}
+QD void dq_iq3_xxs(const block_iq3_xxs * x, float * y, DqTab t) {   // (uint32 points, zero-extended in the table)
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t * qs = x->qs;
+    const uint8_t * scales_and_signs = qs + QK_K/4;
+    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+        uint32_t aux32;
+        memcpy(&aux32, scales_and_signs + 4*ib32, sizeof(uint32_t));
+        const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t signs = ksigns((aux32 >> 7*l) & 127);
+            const uint8_t * grid1 = (const uint8_t *) (t.grid + qs[2*l+0]);
+            const uint8_t * grid2 = (const uint8_t *) (t.grid + qs[2*l+1]);
+            for (int j = 0; j < 4; ++j) {
+                y[j+0] = db * grid1[j] * sgn8(signs, j+0);
+                y[j+4] = db * grid2[j] * sgn8(signs, j+4);
+            }
+            y += 8;
+        }
+        qs += 8;
+    }
+}
+QD void dq_iq3_s(const block_iq3_s * x, float * y, DqTab t) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t * qs = x->qs;
+    const uint8_t * qh = x->qh;
+    const uint8_t * signs = x->signs;
+    for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+        const float db1 = d * (1 + 2*(x->scales[ib32/2] & 0xf));
+        const float db2 = d * (1 + 2*(x->scales[ib32/2] >>  4));
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid1 = (const uint8_t *) (t.grid + (qs[2*l+0] | ((qh[0] << (8-2*l)) & 256)));
+            const uint8_t * grid2 = (const uint8_t *) (t.grid + (qs[2*l+1] | ((qh[0] << (7-2*l)) & 256)));
+            for (int j = 0; j < 4; ++j) {
+                y[j+0] = db1 * grid1[j] * sgn8(signs[l], j+0);
+                y[j+4] = db1 * grid2[j] * sgn8(signs[l], j+4);
+            }
+            y += 8;
+        }
+        qs += 8;
+        signs += 4;
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t * grid1 = (const uint8_t *) (t.grid + (qs[2*l+0] | ((qh[1] << (8-2*l)) & 256)));
+            const uint8_t * grid2 = (const uint8_t *) (t.grid + (qs[2*l+1] | ((qh[1] << (7-2*l)) & 256)));
+            for (int j = 0; j < 4; ++j) {
+                y[j+0] = db2 * grid1[j] * sgn8(signs[l], j+0);
+                y[j+4] = db2 * grid2[j] * sgn8(signs[l], j+4);
+            }
+            y += 8;
+        }
+        qh += 2;
+        qs += 8;
+        signs += 4;
+    }
+}
+QD void dq_iq1_s(const block_iq1_s * x, float * y, DqTab t) {
+    const float d = fp16_to_fp32(x->d);
+    const uint8_t  * qs = x->qs;
+    const uint16_t * qh = x->qh;
+    for (int ib = 0; ib < QK_K/32; ++ib) {
+        const float dl = d * (2*((qh[ib] >> 12) & 7) + 1);
+        const float delta = qh[ib] & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
+        for (int l = 0; l < 4; ++l) {
+            const int8_t * grid = (const int8_t *) (t.grid + (qs[l] | (((qh[ib] >> 3*l) & 7) << 8)));
+            for (int j = 0; j < 8; ++j) y[j] = dl * (grid[j] + delta);
+            y += 8;
+        }
+        qs += 4;
+    }
+}
+QD void dq_iq1_m(const block_iq1_m * x, float * y, DqTab t) {
+    const uint16_t * sc = (const uint16_t *) x->scales;
+    const uint16_t scale = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d = fp16_to_fp32(scale);
+    const uint8_t * qs = x->qs;
+    const uint8_t * qh = x->qh;
+    for (int ib = 0; ib < QK_K/32; ++ib) {
+        const float dl1 = d * (2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1);
+        const float dl2 = d * (2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1);
+        uint16_t idx[4];
+        float delta[4];
+        idx[0] = qs[0] | ((qh[0] << 8) & 0x700);
+        idx[1] = qs[1] | ((qh[0] << 4) & 0x700);
+        idx[2] = qs[2] | ((qh[1] << 8) & 0x700);
+        idx[3] = qs[3] | ((qh[1] << 4) & 0x700);
+        delta[0] = qh[0] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+        delta[1] = qh[0] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+        delta[2] = qh[1] & 0x08 ? -IQ1S_DELTA : IQ1S_DELTA;
+        delta[3] = qh[1] & 0x80 ? -IQ1S_DELTA : IQ1S_DELTA;
+        for (int l = 0; l < 2; ++l) {
+            const int8_t * grid = (const int8_t *) (t.grid + idx[l]);
+            for (int j = 0; j < 8; ++j) y[j] = dl1 * (grid[j] + delta[l]);
+            y += 8;
+        }
+        for (int l = 2; l < 4; ++l) {
+            const int8_t * grid = (const int8_t *) (t.grid + idx[l]);
+            for (int j = 0; j < 8; ++j) y[j] = dl2 * (grid[j] + delta[l]);
+            y += 8;
+        }
+        qs += 4;
+        qh += 2;
+    }
+}
+QD void dq_iq4_xs(const block_iq4_xs * x, float * y, DqTab) {
+    const uint8_t * qs = x->qs;
+    const float d = fp16_to_fp32(x->d);
+    for (int ib = 0; ib < QK_K/32; ++ib) {
+        const int ls = ((x->scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x->scales_h >> 2*ib) & 3) << 4);
+        const float dl = d * (ls - 32);
+        for (int j = 0; j < 16; ++j) {
+            y[j+ 0] = dl * kvalues_iq4nl[qs[j] & 0xf];
+            y[j+16] = dl * kvalues_iq4nl[qs[j] >>  4];
+        }
+        y  += 32;
+        qs += 16;
+    }
+}
+
+template <typename B, void (*DQ)(const B *, float *, DqTab)>
+__global__ void kdqq(const B * x, float * y, int64_t nblocks, DqTab t) {
+    const int64_t b = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= nblocks) return;
+    DQ(x + b, y + b*QK_K, t);
 }
 
 namespace {
@@ -1408,6 +1595,12 @@ bool grow(void ** p, size_t * cap, size_t need) {
     if (hipMalloc(p, need) != hipSuccess) return false;
     *cap = need;
     return true;
+}
+
+DqTab tab_dq(int type) {
+    const int want = 1000 + (type == T_IQ1_M ? T_IQ1_S : type);   // (IQ1_M reads IQ1_S's grid, as in ggml)
+    for (auto & d : g_tabs) if (d.type == want) return DqTab{d.grid};
+    return DqTab{nullptr};
 }
 
 Tab tab_for(int type) {
@@ -1428,11 +1621,13 @@ extern "C" int gpuq_init(const char * tables, int device) {
         if (fread(grid.data(), 8, hdr[1], f) != (size_t) hdr[1] || fread(map.data(), 4, hdr[2], f) != (size_t) hdr[2] ||
             fread(neigh.data(), 2, hdr[3], f) != (size_t) hdr[3]) { fclose(f); return 3; }
         DevTab d{hdr[0], nullptr, nullptr, nullptr};
-        if (hipMalloc(&d.grid, grid.size()*8) != hipSuccess || hipMalloc(&d.map, map.size()*4) != hipSuccess ||
-            hipMalloc(&d.neigh, neigh.size()*2) != hipSuccess) { fclose(f); return 4; }
+        if (hipMalloc(&d.grid, grid.size()*8) != hipSuccess) { fclose(f); return 4; }
         (void) hipMemcpy(d.grid, grid.data(), grid.size()*8, hipMemcpyHostToDevice);
-        (void) hipMemcpy(d.map, map.data(), map.size()*4, hipMemcpyHostToDevice);
-        (void) hipMemcpy(d.neigh, neigh.data(), neigh.size()*2, hipMemcpyHostToDevice);
+        if (!map.empty()) {   // (the dequantizer's grids, type >= 1000, have no map and no neighbours)
+            if (hipMalloc(&d.map, map.size()*4) != hipSuccess || hipMalloc(&d.neigh, neigh.size()*2) != hipSuccess) { fclose(f); return 4; }
+            (void) hipMemcpy(d.map, map.data(), map.size()*4, hipMemcpyHostToDevice);
+            (void) hipMemcpy(d.neigh, neigh.data(), neigh.size()*2, hipMemcpyHostToDevice);
+        }
         g_tabs.push_back(d);
     }
     fclose(f);
@@ -1518,15 +1713,15 @@ size_t quantize_gx(int type, void * dst, int64_t nrow, int64_t n_per_row, const 
     const int th = 64;
     const dim3 grid((unsigned) ((nblocks + th - 1) / th));
     switch (type) {
-        case T_IQ2_XXS: kq<block_iq2_xxs, q_iq2_xxs><<<grid, th>>>(g_x, g_qw, (block_iq2_xxs *) g_y, nblocks, nb_row, t); break;
-        case T_IQ2_S:   kq<block_iq2_s,   q_iq2_s  ><<<grid, th>>>(g_x, g_qw, (block_iq2_s *)   g_y, nblocks, nb_row, t); break;
-        case T_IQ1_S:   kq<block_iq1_s,   q_iq1_s  ><<<grid, th>>>(g_x, g_qw, (block_iq1_s *)   g_y, nblocks, nb_row, t); break;
-        case T_IQ1_M:   kq<block_iq1_m,   q_iq1_m  ><<<grid, th>>>(g_x, g_qw, (block_iq1_m *)   g_y, nblocks, nb_row, t); break;
-        case T_IQ2_XS:  kq<block_iq2_xs,  q_iq2_xs ><<<grid, th>>>(g_x, g_qw, (block_iq2_xs *)  g_y, nblocks, nb_row, t); break;
-        case T_IQ3_XXS: kq<block_iq3_xxs, q_iq3_xxs><<<grid, th>>>(g_x, g_qw, (block_iq3_xxs *) g_y, nblocks, nb_row, t); break;
-        case T_IQ3_S:   kq<block_iq3_s,   q_iq3_s  ><<<grid, th>>>(g_x, g_qw, (block_iq3_s *)   g_y, nblocks, nb_row, t); break;
-        case T_IQ4_XS:  kq<block_iq4_xs,  q_iq4_xs ><<<grid, th>>>(g_x, g_qw, (block_iq4_xs *)  g_y, nblocks, nb_row, t); break;
-        case T_IQ4_NL:  kq<block_iq4_nl,  q_iq4_nl, QK4_NL><<<grid, th>>>(g_x, g_qw, (block_iq4_nl *) g_y, nblocks, nb_row, t); break;
+        case T_IQ2_XXS: kq<block_iq2_xxs, q_iq2_xxs><<<grid, th>>>(g_x, g_qw, (block_iq2_xxs *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ2_S:   kq<block_iq2_s,   q_iq2_s  ><<<grid, th>>>(g_x, g_qw, (block_iq2_s *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ1_S:   kq<block_iq1_s,   q_iq1_s  ><<<grid, th>>>(g_x, g_qw, (block_iq1_s *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ1_M:   kq<block_iq1_m,   q_iq1_m  ><<<grid, th>>>(g_x, g_qw, (block_iq1_m *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ2_XS:  kq<block_iq2_xs,  q_iq2_xs ><<<grid, th>>>(g_x, g_qw, (block_iq2_xs *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ3_XXS: kq<block_iq3_xxs, q_iq3_xxs><<<grid, th>>>(g_x, g_qw, (block_iq3_xxs *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ3_S:   kq<block_iq3_s,   q_iq3_s  ><<<grid, th>>>(g_x, g_qw, (block_iq3_s *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ4_XS:  kq<block_iq4_xs,  q_iq4_xs ><<<grid, th>>>(g_x, g_qw, (block_iq4_xs *) g_y, nblocks, nb_row, 1, t); break;
+        case T_IQ4_NL:  kq<block_iq4_nl,  q_iq4_nl, QK4_NL><<<grid, th>>>(g_x, g_qw, (block_iq4_nl *) g_y, nblocks, nb_row, 1, t); break;
     }
     if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 0;
     if (hipMemcpy(dst, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
@@ -1565,4 +1760,77 @@ extern "C" size_t gpuq_requantize(int src, const void * raw, int type, void * ds
     kdq<<<(unsigned) ((n/32 + th - 1) / th), th>>>(src, g_raw, g_x, n);
     if (hipGetLastError() != hipSuccess) return 0;
     return quantize_gx(type, dst, nrow, n_per_row, imatrix);
+}
+
+// ---------------------------------------------------------------- device-pointer API (the caller's stream, no sync)
+namespace {
+bool launch_q(int type, const float * x, const float * qw, void * y, int64_t nblocks, int64_t qw_mod, int64_t qw_div,
+              hipStream_t st) {
+    const Tab t = tab_for(type);
+    const int th = 64;
+    const dim3 grid((unsigned) ((nblocks + th - 1) / th));
+    switch (type) {
+        case T_IQ2_XXS: kq<block_iq2_xxs, q_iq2_xxs><<<grid, th, 0, st>>>(x, qw, (block_iq2_xxs *) y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ2_S:   kq<block_iq2_s,   q_iq2_s  ><<<grid, th, 0, st>>>(x, qw, (block_iq2_s *)   y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ1_S:   kq<block_iq1_s,   q_iq1_s  ><<<grid, th, 0, st>>>(x, qw, (block_iq1_s *)   y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ1_M:   kq<block_iq1_m,   q_iq1_m  ><<<grid, th, 0, st>>>(x, qw, (block_iq1_m *)   y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ2_XS:  kq<block_iq2_xs,  q_iq2_xs ><<<grid, th, 0, st>>>(x, qw, (block_iq2_xs *)  y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ3_XXS: kq<block_iq3_xxs, q_iq3_xxs><<<grid, th, 0, st>>>(x, qw, (block_iq3_xxs *) y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ3_S:   kq<block_iq3_s,   q_iq3_s  ><<<grid, th, 0, st>>>(x, qw, (block_iq3_s *)   y, nblocks, qw_mod, qw_div, t); break;
+        case T_IQ4_XS:  kq<block_iq4_xs,  q_iq4_xs ><<<grid, th, 0, st>>>(x, qw, (block_iq4_xs *)  y, nblocks, qw_mod, qw_div, t); break;
+        default: return false;
+    }
+    return hipGetLastError() == hipSuccess;
+}
+}
+
+// nblocks 256-weight super-blocks of d_x (contiguous, [nblocks][256] f32 on the device) -> d_dst (nblocks blocks of
+// the type), block b weighted by d_qw + ((b % qw_mod) / qw_div) * 256 (one row of nb super-blocks sharing an imatrix
+// row: qw_mod = nb, qw_div = 1; a column block of r rows per matrix, one imatrix row a matrix: qw_mod = nblocks,
+// qw_div = r). Returns the bytes written (0: unknown type / missing tables / launch error). Not for IQ4_NL (32-blocks).
+extern "C" size_t gpuq_quantize_dev(int type, const float * d_x, void * d_dst, int64_t nblocks, const float * d_qw,
+                                    int64_t qw_mod, int64_t qw_div, void * stream) {
+    const size_t bb = gpuq_block_bytes(type);
+    if (!bb || type == T_IQ4_NL || !(type == T_IQ4_XS || tab_for(type).grid) || nblocks <= 0 || qw_mod <= 0 || qw_div <= 0) return 0;
+    if (!launch_q(type, d_x, d_qw, d_dst, nblocks, qw_mod, qw_div, (hipStream_t) stream)) return 0;
+    return nblocks * bb;
+}
+
+// 1 when gpuq_dequantize_dev can decode this ggml type
+extern "C" int gpuq_can_dequantize_type(int type) {
+    switch (type) {
+        case T_IQ2_XXS: case T_IQ2_XS: case T_IQ2_S: case T_IQ3_XXS: case T_IQ3_S: case T_IQ1_S: case T_IQ1_M:
+            return tab_dq(type).grid != nullptr;
+        case T_IQ4_XS: return 1;
+        default: return 0;
+    }
+}
+
+// nblocks super-blocks of the type (device) -> nblocks * 256 floats (device): ggml's to_float, bit for bit
+extern "C" size_t gpuq_dequantize_dev(int type, const void * d_q, float * d_out, int64_t nblocks, void * stream) {
+    if (!gpuq_can_dequantize_type(type) || nblocks <= 0) return 0;
+    const DqTab t = tab_dq(type);
+    const hipStream_t st = (hipStream_t) stream;
+    const int th = 64;
+    const dim3 grid((unsigned) ((nblocks + th - 1) / th));
+    switch (type) {
+        case T_IQ2_XXS: kdqq<block_iq2_xxs, dq_iq2_xxs><<<grid, th, 0, st>>>((const block_iq2_xxs *) d_q, d_out, nblocks, t); break;
+        case T_IQ2_XS:  kdqq<block_iq2_xs,  dq_iq2_xs ><<<grid, th, 0, st>>>((const block_iq2_xs *)  d_q, d_out, nblocks, t); break;
+        case T_IQ2_S:   kdqq<block_iq2_s,   dq_iq2_s  ><<<grid, th, 0, st>>>((const block_iq2_s *)   d_q, d_out, nblocks, t); break;
+        case T_IQ3_XXS: kdqq<block_iq3_xxs, dq_iq3_xxs><<<grid, th, 0, st>>>((const block_iq3_xxs *) d_q, d_out, nblocks, t); break;
+        case T_IQ3_S:   kdqq<block_iq3_s,   dq_iq3_s  ><<<grid, th, 0, st>>>((const block_iq3_s *)   d_q, d_out, nblocks, t); break;
+        case T_IQ1_S:   kdqq<block_iq1_s,   dq_iq1_s  ><<<grid, th, 0, st>>>((const block_iq1_s *)   d_q, d_out, nblocks, t); break;
+        case T_IQ1_M:   kdqq<block_iq1_m,   dq_iq1_m  ><<<grid, th, 0, st>>>((const block_iq1_m *)   d_q, d_out, nblocks, t); break;
+        case T_IQ4_XS:  kdqq<block_iq4_xs,  dq_iq4_xs ><<<grid, th, 0, st>>>((const block_iq4_xs *)  d_q, d_out, nblocks, t); break;
+        default: return 0;
+    }
+    return hipGetLastError() == hipSuccess ? (size_t) nblocks * QK_K * 4 : 0;
+}
+
+// n values of source type src (F32 / F16 / BF16 / Q8_0 / MXFP4 bytes on the device) -> n floats on the device
+extern "C" size_t gpuq_dequantize_src_dev(int src, const void * d_raw, float * d_out, int64_t n, void * stream) {
+    if (!raw_bytes(src, 32) || n <= 0 || n % 32) return 0;
+    const int th = 128;
+    kdq<<<(unsigned) ((n/32 + th - 1) / th), th, 0, (hipStream_t) stream>>>(src, (const uint8_t *) d_raw, d_out, n);
+    return hipGetLastError() == hipSuccess ? (size_t) n * 4 : 0;
 }
