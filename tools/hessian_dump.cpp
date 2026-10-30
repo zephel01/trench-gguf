@@ -9,8 +9,9 @@
 // layer L, one row a token, the same for all experts) and the routing ids:
 //   <out>/blk.L.x.bf16      n_tokens x n_embd      bf16 (ggml's round-to-nearest)
 //   <out>/blk.L.ids.i32     n_tokens x n_expert_used int32
-//   <out>/blk.L.w.f32       n_tokens x n_expert_used f32, the routing weights the model multiplies the expert outputs
-//                           with (the last ffn_moe_weights* node of the layer), when the graph names them
+//   <out>/blk.L.w_<v>.f32   n_tokens x n_expert_used f32, the routing weights: v = raw (ffn_moe_weights), norm (after
+//                           normalization), scaled (after the model's scale) - whichever the graph names; the last
+//                           stage present is what multiplies the expert outputs
 // --dump-down also writes the input of blk.L.ffn_down_exps.weight (one row a token and slot, 3-4x the bytes of x):
 //   <out>/blk.L.a.bf16      n_tokens x n_expert_used x n_ff
 // Without it, the offline side recomputes a = silu(gate x) * (up x) from x and the original gate/up weights (the ones
@@ -86,20 +87,25 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
                         (long) t->src[2]->ne[0], (long) t->src[2]->ne[1], L, L >= d.lo && L <= d.hi ? "DUMP" : "skip");
             return L >= d.lo && L <= d.hi;
         }
-        if (!strncmp(t->name, "ffn_moe_weights", 15)) {   // ffn_moe_weights-L, _norm-L, _scaled-L ...
-            const char * dash = strrchr(t->name, '-');
-            if (!dash) return false;
-            const int L = atoi(dash + 1);
+        if (!strncmp(t->name, "ffn_moe_weights", 15)) {   // the routing weights: raw, after normalization, after scaling
+            int L = -1; char tail[32] = {0};
+            if (sscanf(t->name, "ffn_moe_weights-%d%31s", &L, tail) < 1 || tail[0]) {
+                if (sscanf(t->name, "ffn_moe_weights_norm-%d%31s", &L, tail) < 1 || tail[0]) {
+                    if (sscanf(t->name, "ffn_moe_weights_scaled-%d%31s", &L, tail) < 1 || tail[0]) return false;
+                }
+            }
             if (L < d.lo || L > d.hi) return false;
-            d.wname[L] = t->name;   // (the last one named for the layer is what multiplies the experts)
+            if (d.wname[L].find(t->name) == std::string::npos) d.wname[L] += std::string(t->name) + " ";
             return true;
         }
         return false;
     }
-    if (t->op != GGML_OP_MUL_MAT_ID) {   // a weights node: [1, n_ids, n_tokens] f32
+    if (t->op != GGML_OP_MUL_MAT_ID) {   // a weights node: [1, n_ids, n_tokens] or [n_ids, n_tokens] f32
         const char * dash = strrchr(t->name, '-');
         const int L = atoi(dash + 1);
-        if (d.wname[L] != t->name || t->type != GGML_TYPE_F32) return true;
+        if (t->type != GGML_TYPE_F32) return true;
+        const char * suffix = !strncmp(t->name, "ffn_moe_weights_scaled", 22) ? "scaled" :
+                              !strncmp(t->name, "ffn_moe_weights_norm", 20) ? "norm" : "raw";
         get_tensor(t, d.buf);
         const bool lead1 = t->ne[0] == 1;   // [1, n_ids, n_tok] (llama.cpp's weights) or [n_ids, n_tok]
         const int64_t n_ids = lead1 ? t->ne[1] : t->ne[0], n_tok = lead1 ? t->ne[2] : t->ne[1];
@@ -111,7 +117,7 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
         for (int64_t r = 0; r < n_tok; ++r)
             for (int64_t j = 0; j < n_ids; ++j)
                 w[r * n_ids + j] = *(const float *) (d.buf.data() + r * nb_r + j * nb_j);
-        fwrite(w.data(), 4, w.size(), d.file("blk." + std::to_string(L) + ".w.f32"));
+        fwrite(w.data(), 4, w.size(), d.file("blk." + std::to_string(L) + ".w_" + suffix + ".f32"));
         return true;
     }
     const ggml_tensor * src1 = t->src[1];

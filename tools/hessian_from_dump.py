@@ -34,8 +34,11 @@ class LayerDump:
         self.x = np.memmap(pre + "x.bf16", dtype=np.uint16, mode="r").reshape(self.n, self.n_embd)
         self.a = np.memmap(pre + "a.bf16", dtype=np.uint16, mode="r").reshape(self.n, self.n_ids, self.n_ff) \
             if os.path.exists(pre + "a.bf16") else None
-        self.w = np.memmap(pre + "w.f32", dtype=np.float32, mode="r").reshape(self.n, self.n_ids) \
-            if os.path.exists(pre + "w.f32") else None
+        self.w = None   # the routing weights at the last stage the graph names (scaled > norm > raw)
+        for v in ("scaled", "norm", "raw"):
+            if os.path.exists(pre + "w_%s.f32" % v):
+                self.w = np.memmap(pre + "w_%s.f32" % v, dtype=np.float32, mode="r").reshape(self.n, self.n_ids)
+                break
         # rows per expert, once: sort the (token, slot) pairs by expert
         flat = np.asarray(self.ids).reshape(-1)
         order = np.argsort(flat, kind="stable")
