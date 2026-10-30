@@ -531,8 +531,8 @@ def main() -> int:
 
                 damp_t = hess_opt["damp_iq1"] if hess_opt["damp_iq1"] is not None and new_type in (Q.IQ1_S, Q.IQ1_M) else hess_opt["damp"]
 
-                def factor(H, n):
-                    if dump is not None and dump_device != "numpy":
+                def factor(H, n):   # (torch on --dump-device for a dump, and for --hessian files when it is a GPU)
+                    if (dump is not None and dump_device != "numpy") or dump_device == "cuda":
                         return ldlq.prepare_hessian_torch(H, n, damp=damp_t, order=hess_opt["order"], device=dump_device)
                     return ldlq.prepare_hessian(H, n, damp=damp_t, order=hess_opt["order"])
 
