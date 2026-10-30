@@ -292,15 +292,26 @@ def prepare_hessian_torch(H, n, damp=0.01, order="seq", bs=QK_K, device="cuda"):
     else:
         blk_order = torch.arange(nblk, device=device)
     perm = (blk_order[:, None] * bs + torch.arange(bs, device=device)[None]).reshape(-1)
-    Hp = Hn[perm][:, perm].to(dt)
-    mean_d = float(torch.diagonal(Hp).mean())
-    Hp.diagonal().add_(damp * mean_d)
-    try:
+    Hp64 = Hn[perm][:, perm]
+    mean_d = float(torch.diagonal(Hp64).mean())
+
+    def factor(dtype, extra):
+        Hp = Hp64.to(dtype).clone()
+        Hp.diagonal().add_((damp + extra) * mean_d)
         Lc = torch.linalg.cholesky(Hp)
-    except Exception:
-        Hp.diagonal().add_(10 * damp * mean_d)
-        Lc = torch.linalg.cholesky(Hp)
-    Hinv = torch.cholesky_inverse(Lc)
-    Hinv = 0.5 * (Hinv + Hinv.T)
-    U = torch.linalg.cholesky(Hinv, upper=True)
+        Hinv = torch.cholesky_inverse(Lc)
+        Hinv = 0.5 * (Hinv + Hinv.T)
+        return torch.linalg.cholesky(Hinv, upper=True)
+
+    # float32 on the GPU first; a Hessian whose ridge is swamped by a few huge diagonal entries (massive activations)
+    # is not positive-definite in float32 - then float64, then more ridge (a non-PD case is rare: it costs seconds)
+    U = None
+    for dtype, extra in ((dt, 0.0), (torch.float64, 0.0), (torch.float64, 10 * damp), (torch.float64, 100 * damp)):
+        try:
+            U = factor(dtype, extra)
+            break
+        except Exception:
+            continue
+    if U is None:
+        raise RuntimeError("Hessian could not be factored even with %.0f%% ridge" % (100 * (damp + 100 * damp)))
     return (U.double().cpu().numpy(), perm.cpu().numpy(), d[perm].cpu().numpy(), dead.cpu().numpy())
