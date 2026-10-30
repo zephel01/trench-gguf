@@ -5,7 +5,7 @@ the same way as one expert.
 usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix.gguf> [--check] [--threads=N]
                          [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--damp-iq1=D] [--order=seq|act] [--weights=imatrix|diag|schur]
                          [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
-                         [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]]
+                         [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]] [--ldlq-cpu] [--ldlq-f32] [--gpu-threads=N]
                          [--dense-dump=<hessian_dump --dense dir> [--dense-max-rows=N]] [--only-matched]
   rules file: one "<tensor name regex> <type>" a line (# comments), the first match wins, e.g.
       blk\\.(2[4-9]|30)\\.ffn_(gate|up)_exps\\.weight  iq3_xxs
@@ -52,6 +52,13 @@ closed per 256-weight super-block, as the i-quants). A tensor without imatrix da
 grouped attn_output_a) takes diag(H)/n as the importance. --dense-max-rows caps the rows a Hessian is summed over.
 The down input recompute (--dump) applies the model's SwiGLU clamp (<arch>.swiglu_clamp_exp, DeepSeek V4 / V4.1) as
 llama.cpp's ggml_swiglu_clamp does.
+
+With --gpu and --dump-device=cuda the whole error-feedback loop runs on the GPU (tools/ldlq.py quantize_matrix_torch:
+the weights stay on the device, gpuq's device kernels quantize and dequantize each super-block column, the error update
+is a GPU GEMM in float64 as on the CPU; gate and up of an expert go through as one batch). The bytes are not bit for bit
+the CPU loop's (another GEMM summation order), the quality is the same within run noise. --ldlq-cpu keeps the CPU loop
+(numpy, --threads), --ldlq-f32 does the error update in float32 (faster where float64 is slow, a little more drift),
+--gpu-threads=N experts in flight on the GPU at once (default 4; each holds one expert's Hessian and factor).
 
 --only-matched writes only the re-quantized tensors: one GGUF a source shard that has any (same file name, shard 1's
 metadata minus the split keys, no copies of the untouched tensors). For donors of per-layer mixes (an Abyss pack's
@@ -240,6 +247,9 @@ def main() -> int:
     dense_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-dump=")), None)
     dense_max = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-max-rows=")), 0))
     only_matched = "--only-matched" in flags
+    ldlq_cpu = "--ldlq-cpu" in flags
+    ldlq_f64 = "--ldlq-f32" not in flags
+    gpu_threads = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--gpu-threads=")), min(threads, 4)))
     dense = None
     if hess_dir or dump_dir or dense_dir:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -283,6 +293,17 @@ def main() -> int:
         if rc != 0:
             print("gpuq_init failed (%d)" % rc)
             return 1
+    # the error-feedback loop on the GPU: gpuq's device kernels + torch on the same device
+    gpu_ldlq = gq is not None and dump_device == "cuda" and not ldlq_cpu and (hess_dir or dump_dir or dense_dir)
+    torch = None
+    if gpu_ldlq:
+        import torch
+        if not torch.cuda.is_available():
+            print("--dump-device=cuda: torch has no GPU here")
+            return 1
+        if not hasattr(gq, "gpuq_quantize_dev"):
+            print("this libgpuq.so has no device-pointer API (rebuild it: ./build.sh): the LDLQ loop runs on the CPU")
+            gpu_ldlq = False
 
     m = re.match(r"(.*)-(\d{5})-of-(\d{5})\.gguf$", os.path.basename(shard1))
     shards = [shard1] if m is None else [
@@ -435,26 +456,34 @@ def main() -> int:
                         hess = os.path.basename(hf[0])
                         get_H = lambda e, H_all=H_all, H_counts=H_counts: (np.asarray(H_all[e], dtype=np.float64), H_counts[e])
                         share_key = hf[0]   # (gate and up share the Hessian: factor it once)
+                        hkind = "file"
             elif dump is not None and len(t.shape) == 3:
                 mm = re.match(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$", t.name)
                 if mm and dump.has(int(mm.group(1))):
                     Ld = int(mm.group(1))
                     hess = "dump blk.%d" % Ld
                     if mm.group(2) == "down":
-                        def get_H(e, Ld=Ld):
-                            Wg = src_shards.dequant_expert("blk.%d.ffn_gate_exps.weight" % Ld, e)
-                            Wu = src_shards.dequant_expert("blk.%d.ffn_up_exps.weight" % Ld, e)
+                        def get_H(e, Ld=Ld, torch_out=False, W_dev=None):
+                            if W_dev is not None:   # (the GPU loop: gate / up decoded on the device)
+                                Wg = W_dev("blk.%d.ffn_gate_exps.weight" % Ld, e)
+                                Wu = W_dev("blk.%d.ffn_up_exps.weight" % Ld, e)
+                            else:
+                                Wg = src_shards.dequant_expert("blk.%d.ffn_gate_exps.weight" % Ld, e)
+                                Wu = src_shards.dequant_expert("blk.%d.ffn_up_exps.weight" % Ld, e)
                             cl = clamp_exp[Ld] if Ld < len(clamp_exp) else 0.0
-                            return dump.hessian_mid(Ld, e, Wg, Wu, gated=hess_opt["gated"], clamp=cl)
+                            return dump.hessian_mid(Ld, e, Wg, Wu, gated=hess_opt["gated"], clamp=cl, torch_out=torch_out)
                         share_key = None
+                        hkind = "dump-down"
                     else:
-                        get_H = lambda e, Ld=Ld: dump.hessian_in(Ld, e, gated=hess_opt["gated"])
+                        get_H = lambda e, Ld=Ld, torch_out=False, W_dev=None: dump.hessian_in(Ld, e, gated=hess_opt["gated"], torch_out=torch_out)
                         share_key = "dump-in-%d" % Ld
+                        hkind = "dump-in"
             elif dense is not None and len(t.shape) == 2 and dense.has(t.name) and (ne2 == 1 or ne2 == dense.groups(t.name)):
                 hess = "dense %s" % dense.file(t.name)
                 get_H = lambda e, nm=t.name: dense.hessian(nm, e)
                 share_key = "dense:" + dense.file(t.name)
                 mm = None
+                hkind = "dense"
             is_dense = hess is not None and hess.startswith("dense")
             if hess is not None and ((im is None and not is_dense) or ne0 % ldlq.QK_K or new_type not in LDLQ_TYPES):
                 hess = None
@@ -519,6 +548,76 @@ def main() -> int:
 
                 fell_back = []   # experts quantized plain: no (or too few) calibration rows for a Hessian
 
+                # the GPU loop: this type's gpuq device kernels (the IQ2_XXS sub-block variant stays on the CPU)
+                on_gpu_loop = gpu_ldlq and on_gpu and not (hess_opt["sub"] and new_type == Q.IQ2_XXS) and \
+                    ldlq.GpuQuant.supported(gq, new_type)
+                if on_gpu_loop:
+                    gqt = ldlq.GpuQuant(gq, new_type, tsize)
+                    dev = torch.device("cuda")
+
+                    def W_dev(name, e):
+                        """expert e of a source tensor as f32 [ne1, ne0] on the device (gpuq decodes F16/BF16/Q8_0/MXFP4
+                        bytes there; other source types through ggml's to_float on the CPU)"""
+                        if name == t.name:
+                            rb, st, n1, n0 = raw[e], src, ne1, ne0
+                        else:
+                            tt = src_shards.tensor(name)
+                            n0, n1 = int(tt.shape[0]), int(tt.shape[1])
+                            rb, st = np.asarray(tt.data).reshape(int(tt.shape[2]), -1)[e], tt.tensor_type
+                        f = gqt.dequant_src(st, rb, n1 * n0, dev)
+                        if f is None:
+                            if name == t.name:
+                                h = np.empty(n1 * n0, dtype=np.float32)
+                                to_float[src](rb.ctypes.data, h.ctypes.data, h.size)
+                            else:
+                                h = src_shards.dequant_expert(name, e)
+                            f = torch.from_numpy(h).to(dev)
+                        return f.reshape(n1, n0)
+
+                    def get_H_dev(e):
+                        if hkind == "dump-down":
+                            H, n = get_H(e, torch_out=True, W_dev=W_dev)
+                        elif hkind == "dump-in":
+                            H, n = get_H(e, torch_out=True)
+                        else:
+                            H, n = get_H(e)
+                            H = torch.as_tensor(np.asarray(H)).to(dev)
+                        return H, n
+
+                    def one_ldlq_gpu(e):
+                        if t.name in stash:
+                            dst[e] = stash[t.name][e]
+                            return per
+                        if share_key is not None and e in hess_cache:   # (U kept on the host between gate and up)
+                            U = perm = diag_n = None
+                            if hess_cache[e][0] is not None:
+                                U, perm, diag_n = (torch.from_numpy(x).to(dev) for x in hess_cache[e][:3])
+                        else:
+                            H, n = get_H_dev(e)
+                            if n < MIN_ROWS:   # (plain rounding, as without a Hessian: the imatrix row still applies)
+                                fell_back.append((e, int(n)))
+                                U = perm = diag_n = dead = None
+                            else:
+                                U, perm, diag_n, dead = ldlq.prepare_hessian_torch(H, n, damp=damp_t, order=hess_opt["order"],
+                                                                                   device="cuda", out="torch")
+                            del H
+                            if share_key is not None and partner is None:
+                                hess_cache[e] = (None, None, None, None) if U is None else (
+                                    U.cpu().numpy(), perm.cpu().numpy(), diag_n.cpu().numpy(), None)
+                        names = [t.name] + ([partner[0]] if partner is not None else [])
+                        Ws = torch.stack([W_dev(nm, e) for nm in names])
+                        ims = torch.from_numpy(np.stack([im_row(e) if nm == t.name else imat[nm][e] for nm in names])).to(dev)
+                        if U is None:
+                            out_b = ldlq.quantize_matrix_torch(Ws, gqt, imatrix=ims, feedback=False)
+                        else:
+                            out_b = ldlq.quantize_matrix_torch(Ws, gqt, U=U, perm=perm, diag_n=diag_n, imatrix=ims, weights=w_mode,
+                                                               feedback=hess_opt["feedback"], f64=ldlq_f64)
+                        out_h = out_b.cpu().numpy()
+                        dst[e] = out_h[0].reshape(-1)
+                        if partner is not None:
+                            stash[partner[0]][e] = out_h[1].reshape(-1)
+                        return per
+
                 def one_ldlq(e):
                     if t.name in stash:
                         dst[e] = stash[t.name][e]
@@ -582,8 +681,10 @@ def main() -> int:
                 ex_map = []
             else:
                 ex_map = None
-            with concurrent.futures.ThreadPoolExecutor(threads) as ex:
-                for e, got in enumerate(ex_map if ex_map is not None else ex.map(one_ldlq if hess is not None else one, range(ne2))):
+            gpu_loop = hess is not None and on_gpu_loop
+            with concurrent.futures.ThreadPoolExecutor(gpu_threads if gpu_loop else threads) as ex:
+                for e, got in enumerate(ex_map if ex_map is not None else ex.map(
+                        (one_ldlq_gpu if gpu_loop else one_ldlq) if hess is not None else one, range(ne2))):
                     if got != per:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
@@ -591,7 +692,7 @@ def main() -> int:
                                 tensor_endianess=r.endianess)
             stash.pop(t.name, None)
             print("  %s -> %s in %.0f s%s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",
-                                                   " (ldlq %s)" % hess if hess is not None else "",
+                                                   " (ldlq%s %s)" % (" gpu" if gpu_loop else "", hess) if hess is not None else "",
                                                    "" if hess is None or not fell_back else " [%d experts plain: fewer than %d rows, e.g. %s]" % (
                                                        len(fell_back), MIN_ROWS, ", ".join("%d:%d" % fb for fb in fell_back[:4]))),
                   flush=True)

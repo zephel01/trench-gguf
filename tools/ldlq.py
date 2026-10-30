@@ -272,13 +272,17 @@ def quantize_matrix_iq2xxs_sub(W, quant, tab, U, perm, imatrix, sub=32, scale_se
     return out.reshape(ne1, nblk * tsize), deq, {}
 
 
-def prepare_hessian_torch(H, n, damp=0.01, order="seq", bs=QK_K, device="cuda"):
+def prepare_hessian_torch(H, n, damp=0.01, order="seq", bs=QK_K, device="cuda", out="numpy"):
     """prepare_hessian with torch on `device` (float32 on a GPU is enough for a damped H; float64 on the CPU).
-    H: numpy [ne0, ne0]. Returns numpy (U float64, perm, diag_n, dead) like prepare_hessian."""
+    H: numpy [ne0, ne0], or a torch tensor already on `device`. Returns numpy (U float64, perm, diag_n, dead) like
+    prepare_hessian, or with out="torch" the same four as tensors on `device` (U float64; for quantize_matrix_torch)."""
     import torch
     dt = torch.float64 if device == "cpu" else torch.float32
     ne0 = H.shape[0]
-    Hn = torch.as_tensor(np.asarray(H), dtype=torch.float64).to(device) / max(float(n), 1.0)
+    if isinstance(H, torch.Tensor):
+        Hn = H.to(device=device, dtype=torch.float64) / max(float(n), 1.0)
+    else:
+        Hn = torch.as_tensor(np.asarray(H), dtype=torch.float64).to(device) / max(float(n), 1.0)
     d = torch.diagonal(Hn).clone()
     dead = d <= 0
     if bool(dead.any()):
@@ -314,4 +318,114 @@ def prepare_hessian_torch(H, n, damp=0.01, order="seq", bs=QK_K, device="cuda"):
             continue
     if U is None:
         raise RuntimeError("Hessian could not be factored even with %.0f%% ridge" % (100 * (damp + 100 * damp)))
+    if out == "torch":
+        return U.double(), perm, d[perm], dead
     return (U.double().cpu().numpy(), perm.cpu().numpy(), d[perm].cpu().numpy(), dead.cpu().numpy())
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The same loop with the weights on the GPU (torch): the block quantizer and its dequantizer are gpuq's device-pointer
+# kernels (gpuq_quantize_dev / gpuq_dequantize_dev, ggml's bytes and ggml's to_float), the error update is a GPU GEMM.
+# The math is quantize_matrix's: U float64, E U_BB^-1 by a float64 triangular solve, the update cast to float32 and
+# subtracted from the float32 weights (f64=False does the update in float32: faster on a GPU with slow float64, the
+# bytes drift a little more from the CPU path). Several matrices that share U, perm and the feedback (gate and up of
+# one expert) go through together as a batch: one kernel launch a block quantizes all their rows.
+
+class GpuQuant:
+    """gpuq's device-pointer quantizer / dequantizer of one type for torch tensors (ctypes handle gq, see gpuq.hip)."""
+
+    def __init__(self, gq, typ, tsize, bs=QK_K):
+        import ctypes
+        self.gq, self.typ, self.tsize, self.bs = gq, int(typ), tsize, bs
+        if not hasattr(gq, "_dev_api"):
+            gq.gpuq_quantize_dev.restype = ctypes.c_size_t
+            gq.gpuq_quantize_dev.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p,
+                                             ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
+            gq.gpuq_dequantize_dev.restype = ctypes.c_size_t
+            gq.gpuq_dequantize_dev.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
+            gq.gpuq_dequantize_src_dev.restype = ctypes.c_size_t
+            gq.gpuq_dequantize_src_dev.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
+            gq.gpuq_can_dequantize_type.restype = ctypes.c_int
+            gq._dev_api = True
+
+    @staticmethod
+    def supported(gq, typ):
+        GpuQuant(gq, typ, 0)
+        return gq.gpuq_block_bytes(int(typ)) > 0 and int(typ) != 20 and gq.gpuq_can_dequantize_type(int(typ)) == 1
+
+    @staticmethod
+    def _stream():
+        import torch
+        return torch.cuda.current_stream().cuda_stream
+
+    def quant(self, blk, qw, raw):
+        """blk [B, rows, bs] f32 contiguous on the device, qw [B, bs] f32 contiguous -> raw [B, rows, tsize] uint8 (filled)"""
+        B, rows = blk.shape[0], blk.shape[1]
+        got = self.gq.gpuq_quantize_dev(self.typ, blk.data_ptr(), raw.data_ptr(), B * rows, qw.data_ptr(), B * rows, rows,
+                                        self._stream())
+        if got != B * rows * self.tsize:
+            raise RuntimeError("gpuq_quantize_dev failed (type %d, %d blocks)" % (self.typ, B * rows))
+
+    def dequant(self, raw):
+        """raw [B, rows, tsize] uint8 contiguous -> f32 [B, rows, bs]"""
+        import torch
+        B, rows = raw.shape[0], raw.shape[1]
+        f = torch.empty((B, rows, self.bs), dtype=torch.float32, device=raw.device)
+        if self.gq.gpuq_dequantize_dev(self.typ, raw.data_ptr(), f.data_ptr(), B * rows, self._stream()) == 0:
+            raise RuntimeError("gpuq_dequantize_dev failed (type %d)" % self.typ)
+        return f
+
+    def dequant_src(self, src, raw_host, n, device):
+        """the source tensor's bytes (ggml type src: F32/F16/BF16/Q8_0/MXFP4, numpy uint8) -> f32 [n] on the device,
+        or None when gpuq cannot read that type"""
+        import torch
+        if self.gq.gpuq_can_dequantize(int(src)) != 1:
+            return None
+        rb = torch.from_numpy(np.ascontiguousarray(raw_host).reshape(-1)).to(device)
+        f = torch.empty(n, dtype=torch.float32, device=device)
+        if self.gq.gpuq_dequantize_src_dev(int(src), rb.data_ptr(), f.data_ptr(), n, self._stream()) == 0:
+            raise RuntimeError("gpuq_dequantize_src_dev failed (src %d)" % int(src))
+        return f
+
+
+def quantize_matrix_torch(W, gqt, U=None, perm=None, diag_n=None, imatrix=None, weights="imatrix", feedback=True,
+                          bs=QK_K, f64=True):
+    """quantize_matrix on the GPU. W: torch f32 [B, ne1, ne0] on the device (B matrices sharing U and perm, e.g. gate
+    and up of one expert); gqt: GpuQuant of the target type; U: [ne0, ne0] (float32/64) on the device; perm: [ne0] long
+    on the device; diag_n: [ne0] (permuted order); imatrix: [B, ne0] f32 on the device (the rows' importance).
+    Returns uint8 [B, ne1, nblk*tsize] on the device in GGUF row layout (the caller moves it to the host)."""
+    import torch
+    B, ne1, ne0 = W.shape
+    nblk = ne0 // bs
+    tsize = gqt.tsize
+    dev = W.device
+    if perm is None:
+        perm = torch.arange(ne0, device=dev)
+    Wp = W.index_select(2, perm).contiguous()
+    Ud = None
+    if feedback:
+        Ud = U.to(torch.float64 if f64 else torch.float32)
+    if weights == "imatrix":
+        imp = imatrix.index_select(1, perm).contiguous()
+    elif weights == "diag":
+        imp = diag_n.to(torch.float32)[None].expand(B, ne0).contiguous()
+    elif weights != "schur":
+        raise ValueError(weights)
+    blk_order = (perm.view(nblk, bs)[:, 0] // bs).tolist()
+    out = torch.empty((nblk, B, ne1, tsize), dtype=torch.uint8, device=dev)   # slot-major: one block's bytes contiguous
+    for k in range(nblk):
+        c0, c1 = k * bs, (k + 1) * bs
+        blk = Wp[:, :, c0:c1].contiguous()
+        if weights == "schur":
+            Ubb = U[c0:c1, c0:c1].double()
+            qw = torch.diagonal(torch.linalg.inv(Ubb.T @ Ubb)).to(torch.float32)[None].expand(B, bs).contiguous()
+        else:
+            qw = imp[:, c0:c1].contiguous()
+        raw = out[blk_order[k]]
+        gqt.quant(blk, qw, raw)
+        if feedback and k + 1 < nblk:
+            q = gqt.dequant(raw)
+            E = (blk - q).to(Ud.dtype)
+            Es = torch.linalg.solve_triangular(Ud[c0:c1, c0:c1], E, upper=True, left=False)   # E U_BB^-1
+            Wp[:, :, c1:] -= (Es @ Ud[c0:c1, c1:]).to(torch.float32)
+    return out.permute(1, 2, 0, 3).reshape(B, ne1, nblk * tsize)

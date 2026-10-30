@@ -93,20 +93,28 @@ class DumpHessians:
                 xc = xc * torch.from_numpy(gated[c0:c0 + self.chunk]).to(self.device)[:, None]
             yield xc
 
-    def hessian_in(self, L, e, gated=False):
-        """(H_in [n_embd, n_embd] float64 numpy, n rows)"""
+    def _dev(self, W):
+        """float32 [rows, cols] (numpy, or a torch tensor already there) -> tensor on the device"""
+        torch = self.torch
+        if isinstance(W, torch.Tensor):
+            return W.to(self.device)
+        return torch.from_numpy(np.ascontiguousarray(W)).to(self.device)
+
+    def hessian_in(self, L, e, gated=False, torch_out=False):
+        """(H_in [n_embd, n_embd] float64 numpy, n rows); torch_out: the tensor on the device instead of numpy"""
         d = self.layer(L)
         tok, slot = d.rows(e)
         g = None
         if gated and d.w is not None:
             g = np.asarray(d.w)[tok, slot].astype(np.float32)
         H = self._xtx(self._x_chunks(d, tok, g), d.n_embd)
-        return H.cpu().numpy(), len(tok)
+        return (H if torch_out else H.cpu().numpy()), len(tok)
 
-    def hessian_mid(self, L, e, Wg=None, Wu=None, gated=False, clamp=0.0):
-        """(H_mid [n_ff, n_ff] float64 numpy, n rows). Wg, Wu: float32 [n_ff, n_embd] (needed without blk.L.a).
-        clamp > 0: the model's SwiGLU limit (DeepSeek V4 / V4.1 swiglu_clamp_exp, llama.cpp's ggml_swiglu_clamp):
-        a = silu(min(g, clamp)) * clamp(u, -clamp, clamp) in the recompute."""
+    def hessian_mid(self, L, e, Wg=None, Wu=None, gated=False, clamp=0.0, torch_out=False):
+        """(H_mid [n_ff, n_ff] float64 numpy, n rows). Wg, Wu: float32 [n_ff, n_embd] (needed without blk.L.a; numpy
+        or tensors on the device). clamp > 0: the model's SwiGLU limit (DeepSeek V4 / V4.1 swiglu_clamp_exp,
+        llama.cpp's ggml_swiglu_clamp): a = silu(min(g, clamp)) * clamp(u, -clamp, clamp) in the recompute.
+        torch_out: the tensor on the device instead of numpy."""
         torch = self.torch
         d = self.layer(L)
         tok, slot = d.rows(e)
@@ -121,8 +129,8 @@ class DumpHessians:
                         ac = ac * torch.from_numpy(g[c0:c0 + self.chunk]).to(self.device)[:, None]
                     yield ac
             else:
-                wg = torch.from_numpy(np.ascontiguousarray(Wg)).to(self.device)
-                wu = torch.from_numpy(np.ascontiguousarray(Wu)).to(self.device)
+                wg = self._dev(Wg)
+                wu = self._dev(Wu)
                 for xc in self._x_chunks(d, tok, None):
                     gx, ux = xc @ wg.T, xc @ wu.T
                     if clamp and clamp > 0:
@@ -140,7 +148,7 @@ class DumpHessians:
             H = self._xtx(gen2(), n_ff)
         else:
             H = self._xtx(gen(), n_ff)
-        return H.cpu().numpy(), len(tok)
+        return (H if torch_out else H.cpu().numpy()), len(tok)
 
 
 class DenseHessians:

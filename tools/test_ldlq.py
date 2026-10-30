@@ -2,7 +2,10 @@
   1. without feedback, the super-block-wise calls give the same bytes as one whole-row ggml_quantize_chunk call;
   2. the assembled rows dequantize (ggml to_float on whole rows) to the per-block dequantized values;
   3. with feedback on a correlated synthetic Hessian, the proxy loss tr(E H E^T) goes down against plain rounding.
-usage: test_ldlq.py [--types=iq2_xxs,iq1_s,iq1_m,iq2_s] [--rows=64] [--cols=1024]
+  4. --gpu: the GPU loop (quantize_matrix_torch with gpuq's device kernels, GPUQ_DIR / GPUQ_LIB as requant_experts):
+     gpuq_dequantize_dev == ggml's to_float bit for bit, the no-feedback batch of two matrices == ggml's whole-row bytes,
+     and the feedback run against the CPU loop (share of identical super-blocks, proxy loss of both, time).
+usage: test_ldlq.py [--types=iq2_xxs,iq1_s,iq1_m,iq2_s] [--rows=64] [--cols=1024] [--gpu] [--f32]
 """
 import ctypes
 import os
@@ -26,6 +29,16 @@ def main():
     lib.ggml_get_type_traits.restype = ctypes.POINTER(TypeTraits)
     lib.ggml_get_type_traits.argtypes = [ctypes.c_int]
     lib.ggml_quantize_init.argtypes = [ctypes.c_int]
+    gq = torch = None
+    if "--gpu" in flags:
+        import torch
+        from requant_experts import _env
+        here = os.environ.get("GPUQ_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gpuq"))
+        gq = ctypes.CDLL(os.path.join(here, _env("GPUQ_LIB") or "libgpuq.so"))
+        gq.gpuq_init.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        gq.gpuq_block_bytes.restype = ctypes.c_size_t
+        assert gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(os.environ.get("GPUQ_DEVICE", "0"))) == 0
+        dev = torch.device("cuda")
     rng = np.random.default_rng(1)
     # a correlated input: x = A z with a random mixing matrix, n = 4 ne0 rows
     n = 4 * ne0
@@ -83,6 +96,36 @@ def main():
                     100 * (ldlq.proxy_loss(W, deq_sb, H, n) / ldlq.proxy_loss(W, deq_plain, H, n) - 1),
                     np.array_equal(full, deq_sb), time.time() - t1)
             # the no-feedback sub path must reproduce ggml's own choice up to the grid mismatch: just report it
+        if gq is not None and ldlq.GpuQuant.supported(gq, typ):
+            gqt = ldlq.GpuQuant(gq, typ, tsize)
+            # ggml's bytes dequantized on the GPU
+            rt = torch.from_numpy(ref.reshape(ne1, ne0 // bs, tsize).copy()).to(dev).reshape(1, -1, tsize)
+            fg = gqt.dequant(rt).reshape(ne1, ne0).cpu().numpy()
+            to_float(ref.ctypes.data, full.ctypes.data, full.size)
+            dq_same = np.array_equal(fg, full)
+            # a batch of two matrices without feedback: each equals its own whole-row ggml call
+            W2 = (rng.standard_normal((ne1, ne0)) * 0.03).astype(np.float32)
+            im2 = (imatrix * (0.5 + rng.random(ne0, dtype=np.float32))).astype(np.float32)
+            ref2 = np.empty_like(ref)
+            lib.ggml_quantize_chunk(int(typ), W2.ctypes.data, ref2.ctypes.data, 0, ne1, ne0, im2.ctypes.data)
+            Wd = torch.from_numpy(np.stack([W, W2])).to(dev)
+            imd = torch.from_numpy(np.stack([imatrix, im2])).to(dev)
+            pg = ldlq.quantize_matrix_torch(Wd, gqt, imatrix=imd, feedback=False).cpu().numpy()
+            plain_same = np.array_equal(pg[0], ref) and np.array_equal(pg[1], ref2)
+            # with feedback against the CPU loop (the same U)
+            torch.cuda.synchronize()
+            t1 = time.time()
+            fg_b = ldlq.quantize_matrix_torch(Wd[:1], gqt, U=torch.from_numpy(U).to(dev), perm=torch.from_numpy(perm).to(dev),
+                                              diag_n=torch.from_numpy(diag_n).to(dev), imatrix=imd[:1], weights="imatrix",
+                                              feedback=True, f64="--f32" not in flags).cpu().numpy()[0]
+            tg = time.time() - t1
+            to_float(fg_b.ctypes.data, full.ctypes.data, full.size)
+            lg = ldlq.proxy_loss(W, full, H, n)
+            blocks_same = float((fg_b.reshape(ne1, -1, tsize) == fb.reshape(ne1, -1, tsize)).all(-1).mean())
+            print("%-8s gpu: dequant == to_float: %s; plain batch == ggml: %s; feedback vs cpu loop: %.1f%% super-blocks "
+                  "identical, proxy loss %.5g vs %.5g (cpu), %.2f s" % (typ.name.lower(), dq_same, plain_same, 100 * blocks_same,
+                                                                        lg, ldlq.proxy_loss(W, deq_fb, H, n), tg))
+            ok &= dq_same and plain_same
         lp = ldlq.proxy_loss(W, deq_plain, H, n)
         lf = ldlq.proxy_loss(W, deq_fb, H, n)
         la = ldlq.proxy_loss(W, deq_fba, H, n)
