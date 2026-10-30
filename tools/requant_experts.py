@@ -6,6 +6,7 @@ usage: requant_experts.py <in shard 1> <out dir> <rules file> --imatrix=<imatrix
                          [--gpu[=<device>]] [--hessian=<dir> [--damp=0.01] [--order=seq|act] [--weights=imatrix|diag|schur]
                          [--gated] [--no-feedback] [--sub=32|8 [--scale-search=K]]]
                          [--dump=<hessian_dump dir> [--dump-device=cpu|cuda|numpy]]
+                         [--dense-dump=<hessian_dump --dense dir> [--dense-max-rows=N]] [--only-matched]
   rules file: one "<tensor name regex> <type>" a line (# comments), the first match wins, e.g.
       blk\\.(2[4-9]|30)\\.ffn_(gate|up)_exps\\.weight  iq3_xxs
       blk\\.\\d+\\.ffn_down_exps\\.weight             iq2_s
@@ -42,6 +43,19 @@ file are quantized as before.
 fly (tools/hessian_from_dump.py; the down input recomputed from the expert's own gate/up), the factorization in torch
 on --dump-device (cuda = ROCm/CUDA; numpy = no torch at all), gate and up of an expert done together. For a model
 with 256 experts of 4096 inputs this keeps one expert's Hessian in memory at a time instead of 20 GB a layer.
+
+--dense-dump=<dir> runs the same error feedback on the 2-D (dense) tensors the rules name, with Hessians from a
+tools/hessian_dump --dense dump (dense.txt: weight -> input rows; DeepSeek V4's grouped attn_output_a gets one Hessian
+per group, its rows split into the groups). The k-quants Q4_K / Q5_K / Q6_K take the feedback too (their quantizers are
+closed per 256-weight super-block, as the i-quants). A tensor without imatrix data (or one that does not fit, as the
+grouped attn_output_a) takes diag(H)/n as the importance. --dense-max-rows caps the rows a Hessian is summed over.
+The down input recompute (--dump) applies the model's SwiGLU clamp (<arch>.swiglu_clamp_exp, DeepSeek V4 / V4.1) as
+llama.cpp's ggml_swiglu_clamp does.
+
+--only-matched writes only the re-quantized tensors: one GGUF a source shard that has any (same file name, shard 1's
+metadata minus the split keys, no copies of the untouched tensors). For donors of per-layer mixes (an Abyss pack's
+native_experts.txt can take any layer's experts from such a file) and for overlays (a first shard over another
+model's shards, iq_pack.py --first-wins).
 
 Environment: GGUF_PY = llama.cpp/gguf-py (default: the installed gguf package), LIBGGML = <llama.cpp build>/bin/
 libggml-base.so (the CPU quantizer, and the reference the GPU output matches).
@@ -112,7 +126,8 @@ def fit_type(typ, ne0):
     return fb if ne0 % gguf.GGML_QUANT_SIZES[fb][0] == 0 else Q.F16
 
 
-LDLQ_TYPES = {Q.IQ1_S, Q.IQ1_M, Q.IQ2_XXS, Q.IQ2_XS, Q.IQ2_S, Q.IQ3_XXS, Q.IQ3_S, Q.IQ4_XS}   # super-block = 256
+LDLQ_TYPES = {Q.IQ1_S, Q.IQ1_M, Q.IQ2_XXS, Q.IQ2_XS, Q.IQ2_S, Q.IQ3_XXS, Q.IQ3_S, Q.IQ4_XS,
+              Q.Q4_K, Q.Q5_K, Q.Q6_K}   # super-block = 256 (the k-quants: --dense-dump)
 MIN_ROWS = int(os.environ.get("LDLQ_MIN_ROWS", 64))   # an expert with fewer calibration rows is rounded plain
 
 
@@ -220,12 +235,19 @@ def main() -> int:
     dump_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--dump=")), None)
     dump_device = next((a.split("=", 1)[1] for a in flags if a.startswith("--dump-device=")), "cpu")
     dump = src_shards = None
-    if hess_dir or dump_dir:
+    dense_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-dump=")), None)
+    dense_max = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-max-rows=")), 0))
+    only_matched = "--only-matched" in flags
+    dense = None
+    if hess_dir or dump_dir or dense_dir:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import ldlq
     if dump_dir:
         from hessian_from_dump import DumpHessians
         dump = DumpHessians(dump_dir, dump_device if dump_device != "numpy" else "cpu")
+    if dense_dir:
+        from hessian_from_dump import DenseHessians
+        dense = DenseHessians(dense_dir, dump_device if dump_device != "numpy" else "cpu", max_rows=dense_max)
     if len(args) != 3 or imat_path is None:
         print(__doc__)
         return 2
@@ -267,6 +289,17 @@ def main() -> int:
     os.makedirs(out_dir, exist_ok=True)
     total_old = total_new = 0
     arch = None
+    r_first = None   # shard 1's reader: its metadata for --only-matched files, and the SwiGLU clamp
+    clamp_exp = []
+    if os.path.isfile(shards[0]):
+        r_first = gguf.GGUFReader(shards[0])
+        if gguf.Keys.General.ARCHITECTURE in r_first.fields:
+            a0 = r_first.fields[gguf.Keys.General.ARCHITECTURE].contents()
+            f = r_first.fields.get("%s.swiglu_clamp_exp" % a0)
+            if f is not None:
+                v = f.contents()
+                clamp_exp = [float(x) for x in (v if isinstance(v, list) else [v])]
+                print("swiglu clamp (%s.swiglu_clamp_exp): %s" % (a0, sorted(set(clamp_exp))), flush=True)
     for sh in shards:
         if not os.path.isfile(sh):
             print("%s is not there: skipped" % sh)
@@ -276,7 +309,7 @@ def main() -> int:
         except ValueError as e:   # a tensor type gguf-py does not know (DeepSeek V4.1's Engram shard): no experts in it
             out = os.path.join(out_dir, os.path.basename(sh))
             print("%s: gguf-py cannot read it (%s): kept as is (hard link or copy)" % (sh, e), flush=True)
-            if check:
+            if check or only_matched:
                 continue
             if os.path.exists(out):
                 os.remove(out)
@@ -298,6 +331,9 @@ def main() -> int:
                 new_type = None
             if new_type is not None:
                 ne0, ne1, ne2 = (int(x) for x in t.shape) if len(t.shape) == 3 else (int(t.shape[0]), int(t.shape[1]), 1)
+                if dense is not None and len(t.shape) == 2 and dense.has(t.name) and dense.groups(t.name) > 1:
+                    if t.name in imat and imat[t.name].shape[-1] != ne0:
+                        no_im.add(t.name)   # (the imatrix saw the groups as one long row: diag(H)/n instead)
                 fit = fit_type(new_type, ne0)
                 if fit != new_type:
                     print("  %s: rows of %d do not fit %s: %s instead (llama-quantize's fallback)" % (
@@ -330,9 +366,20 @@ def main() -> int:
                                                                new_type.name, nbytes / 2**30))
         if check:
             continue
+        if only_matched:
+            plan_w = [p for p in plan if p[1] is not None]
+            if not plan_w:
+                print("  nothing re-quantized in this shard: no file (--only-matched)", flush=True)
+                continue
+            kv_src = r_first if r_first is not None else r
+        else:
+            plan_w = plan
+            kv_src = r
         w = gguf.GGUFWriter(out, arch)
-        for field in r.fields.values():
+        for field in kv_src.fields.values():
             if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF."):
+                continue
+            if only_matched and field.name.startswith("split."):
                 continue
             if field.name == gguf.Keys.General.ALIGNMENT:   # (keep the source's padding)
                 w.add_custom_alignment(int(field.contents()))
@@ -340,7 +387,7 @@ def main() -> int:
             val_type = field.types[0]
             sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
             w.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
-        for t, new_type, nbytes in plan:
+        for t, new_type, nbytes in plan_w:
             if new_type is not None:
                 ne1, ne2 = int(t.shape[1]), (int(t.shape[2]) if len(t.shape) == 3 else 1)
                 shape = (ne2, ne1, nbytes // (ne2 * ne1)) if len(t.shape) == 3 else (ne1, nbytes // ne1)
@@ -351,7 +398,7 @@ def main() -> int:
         w.write_kv_data_to_file()
         w.write_ti_data_to_file()
         t0 = time.time()
-        for t, new_type, nbytes in plan:
+        for t, new_type, nbytes in plan_w:
             if new_type is None:
                 w.write_tensor_data(t.data, tensor_endianess=r.endianess)
                 continue
@@ -360,6 +407,10 @@ def main() -> int:
             if src not in to_float:
                 to_float[src] = TO_FLOAT(lib.ggml_get_type_traits(int(src)).contents.to_float)
             lib.ggml_quantize_init(int(new_type))
+            if dense is not None and len(t.shape) == 2 and dense.has(t.name) and dense.groups(t.name) > 1:
+                G = dense.groups(t.name)   # (DeepSeek V4's attn_output_a: the rows of group g = a virtual expert g)
+                if ne1 % G == 0:
+                    ne1, ne2 = ne1 // G, G
             raw = np.ascontiguousarray(np.asarray(t.data).reshape(ne2, -1))
             per = nbytes // ne2
             dst = np.empty((ne2, per), dtype=np.uint8)
@@ -391,13 +442,24 @@ def main() -> int:
                         def get_H(e, Ld=Ld):
                             Wg = src_shards.dequant_expert("blk.%d.ffn_gate_exps.weight" % Ld, e)
                             Wu = src_shards.dequant_expert("blk.%d.ffn_up_exps.weight" % Ld, e)
-                            return dump.hessian_mid(Ld, e, Wg, Wu, gated=hess_opt["gated"])
+                            cl = clamp_exp[Ld] if Ld < len(clamp_exp) else 0.0
+                            return dump.hessian_mid(Ld, e, Wg, Wu, gated=hess_opt["gated"], clamp=cl)
                         share_key = None
                     else:
                         get_H = lambda e, Ld=Ld: dump.hessian_in(Ld, e, gated=hess_opt["gated"])
                         share_key = "dump-in-%d" % Ld
-            if hess is not None and (im is None or ne0 % ldlq.QK_K or new_type not in LDLQ_TYPES):
+            elif dense is not None and len(t.shape) == 2 and dense.has(t.name) and (ne2 == 1 or ne2 == dense.groups(t.name)):
+                hess = "dense %s" % dense.file(t.name)
+                get_H = lambda e, nm=t.name: dense.hessian(nm, e)
+                share_key = "dense:" + dense.file(t.name)
+                mm = None
+            is_dense = hess is not None and hess.startswith("dense")
+            if hess is not None and ((im is None and not is_dense) or ne0 % ldlq.QK_K or new_type not in LDLQ_TYPES):
                 hess = None
+                is_dense = False
+            # the importance a super-block's quantizer gets: the imatrix row, or diag(H)/n where there is none
+            w_mode = hess_opt["weights"] if im is not None else "diag"
+            im_row = (lambda e: im[min(e, im.shape[0] - 1)]) if im is not None else (lambda e: np.ones(ne0, dtype=np.float32))
             if hess is not None:
                 if new_type not in to_float:
                     to_float[new_type] = TO_FLOAT(lib.ggml_get_type_traits(int(new_type)).contents.to_float)
@@ -447,7 +509,7 @@ def main() -> int:
                                                                         sub=hess_opt["sub"], scale_search=hess_opt["scale_search"])
                     else:
                         out_b, deq, _ = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, U=U, perm=perm, diag_n=diag_n,
-                                                             imatrix=imrow, weights=hess_opt["weights"],
+                                                             imatrix=imrow, weights=w_mode,
                                                              feedback=hess_opt["feedback"])
                     return out_b.reshape(-1)
 
@@ -472,13 +534,13 @@ def main() -> int:
                         if share_key is not None and partner is None:
                             hess_cache[e] = (U, perm, diag_n, dead)
                     if U is None:
-                        dst[e] = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, imatrix=im[e], feedback=False)[0].reshape(-1)
+                        dst[e] = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, imatrix=im_row(e), feedback=False)[0].reshape(-1)
                         if partner is not None:
                             Wp_ = src_shards.dequant_expert(partner[0], e)
                             stash[partner[0]][e] = ldlq.quantize_matrix(Wp_, quant_blk, dequant_blk, tsize, imatrix=imat[partner[0]][e],
                                                                         feedback=False)[0].reshape(-1)
                         return per
-                    dst[e] = ldlq_one_matrix(W, U, perm, diag_n, im[e])
+                    dst[e] = ldlq_one_matrix(W, U, perm, diag_n, im_row(e))
                     if partner is not None:
                         Wp_ = src_shards.dequant_expert(partner[0], e)
                         stash[partner[0]][e] = ldlq_one_matrix(Wp_, U, perm, diag_n, imat[partner[0]][e])
@@ -521,7 +583,7 @@ def main() -> int:
                     if got != per:
                         print("ggml_quantize_chunk wrote %d bytes, expected %d for %s expert %d" % (got, per, t.name, e))
                         return 1
-            w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne1, per // ne1)),
+            w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne2 * ne1, per // ne1)),
                                 tensor_endianess=r.endianess)
             stash.pop(t.name, None)
             print("  %s -> %s in %.0f s%s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",

@@ -3,7 +3,7 @@
 // chunks a batch as separate sequences).
 //
 //   hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] [--chunks=N]
-//                [--dump-down] [--layers=a-b]
+//                [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe]
 //
 // For every MUL_MAT_ID whose weight is blk.L.ffn_gate_exps.weight it writes the op's input rows (the gate/up input of
 // layer L, one row a token, the same for all experts) and the routing ids:
@@ -20,6 +20,20 @@
 // The rows of every file are in the same order (batch order), so row r of blk.L.x and blk.L.ids belong together.
 // <out>/info.txt records the token count, the shapes and the chunking.
 //
+// --dense[=<regex>] also writes the inputs of the plain MUL_MATs whose weight is a per-layer dense tensor
+// (blk.L.<name>.weight, the name matched by <regex>; default: the attention projections, the indexer projections and
+// the shared expert's down projection - see DENSE_DEFAULT), for GPTQ / LDLQ of the dense tensors:
+//   <out>/blk.L.din.<name>.bf16   rows x [groups x] ne0 bf16, one row a src1 row (a token; the indexer's attn_k: a
+//                                 compressed position). A weight used as a batched 3-D matmul (DeepSeek V4's grouped
+//                                 attn_output_a, [ne0, rank, groups]) gets token-major rows of all groups:
+//                                 [token][group][ne0], so group g's Hessian is the sum over tokens of its slice.
+// Several weights that read the same input tensor (attn_q_a, attn_kv, the compressor and indexer.proj all read
+// attn_norm's output) share one file. <out>/dense.txt maps every weight to its file: "<weight> <file> <ne0> <groups>
+// <rows>". The shared experts' gate/up and the router read the MoE input, which blk.L.x already holds (the offline
+// side takes their Hessian from there). --dense-chunks=N dumps the dense inputs during the first N chunks only (the
+// rows are big: DeepSeek V4.1 ~100 KB a token a layer; 16 chunks = 32K tokens is 4x the widest input).
+// --no-moe skips the expert inputs (a dense-only pass).
+//
 // --gpu: dense tensors on the GPU, experts on the host (as tools/imatrix.py run --gpu / teacher --gpu); the inputs
 // are read back from wherever the op ran. Needs a ROCm/CUDA llama.cpp build (the patched one of setup.sh for models
 // bigger than RAM); without --gpu a CPU build is enough.
@@ -31,12 +45,29 @@
 #include <cstring>
 #include <fstream>
 #include <map>
+#include <regex>
+#include <set>
 #include <string>
 #include <vector>
+
+static const char * DENSE_DEFAULT =
+    "attn_(q_a|q_b|kv|output_a|output_b|compressor_kv|compressor_gate)|indexer\\.(proj|attn_q_b|attn_k)|ffn_down_shexp";
+
+struct DenseFile {
+    std::string file;
+    int64_t ne0 = 0, groups = 1, rows = 0;
+};
 
 struct Dump {
     std::string dir;
     bool down = false;
+    bool moe = true;
+    bool dense = false;
+    bool dense_active = false;          // set by main: still within --dense-chunks
+    std::regex dense_re;
+    std::map<std::string, DenseFile> dense_files;     // file name -> shape and rows written
+    std::map<std::string, std::string> dense_weight;  // weight name -> file name
+    std::map<const ggml_tensor *, std::string> dense_seen;   // this batch: input tensor -> file (cleared per decode)
     int lo = 0, hi = 1 << 30;
     std::map<std::string, FILE *> files;
     std::map<int, int64_t> rows;        // tokens written per layer (from the gate op)
@@ -68,6 +99,23 @@ static int layer_of(const char * name, const char * kind) {
     return strncmp(end + 1, kind, strlen(kind)) == 0 ? (int) L : -1;
 }
 
+// "blk.12.attn_q_b.weight" (or a backend copy "<backend>#blk.12.attn_q_b.weight#0") -> layer 12, short "attn_q_b"
+static int dense_of(const char * name, std::string & shortname) {
+    const char * h = strchr(name, '#');
+    std::string n = h ? std::string(h + 1) : std::string(name);
+    if (h) { const size_t e = n.find('#'); if (e != std::string::npos) n.resize(e); }
+    if (n.compare(0, 4, "blk.")) return -1;
+    char * end;
+    long L = strtol(n.c_str() + 4, &end, 10);
+    if (end == n.c_str() + 4 || *end != '.') return -1;
+    std::string rest(end + 1);
+    const std::string suf = ".weight";
+    if (rest.size() <= suf.size() || rest.compare(rest.size() - suf.size(), suf.size(), suf)) return -1;
+    shortname = rest.substr(0, rest.size() - suf.size());
+    if (shortname.find("_exps") != std::string::npos) return -1;
+    return (int) L;
+}
+
 static void get_tensor(const ggml_tensor * t, std::vector<char> & buf) {
     buf.resize(ggml_nbytes(t));
     ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
@@ -78,7 +126,20 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
     static std::map<std::string, int> seen;
     static const bool debug = getenv("HESSIAN_DUMP_DEBUG") != nullptr;
     if (ask) {
+        if (t->op == GGML_OP_MUL_MAT) {
+            if (!d.dense || !d.dense_active) return false;
+            std::string sn;
+            const int L = dense_of(t->src[0]->name, sn);
+            if (L < d.lo || L > d.hi || !std::regex_match(sn, d.dense_re)) return false;
+            if (debug && seen[t->src[0]->name]++ == 0)
+                fprintf(stderr, "mul_mat src0 '%s' [%ld %ld %ld] src1 '%s' [%ld %ld %ld %ld] %s -> layer %d dense %s\n", t->src[0]->name,
+                        (long) t->src[0]->ne[0], (long) t->src[0]->ne[1], (long) t->src[0]->ne[2], t->src[1]->name,
+                        (long) t->src[1]->ne[0], (long) t->src[1]->ne[1], (long) t->src[1]->ne[2], (long) t->src[1]->ne[3],
+                        ggml_type_name(t->src[1]->type), L, sn.c_str());
+            return true;
+        }
         if (t->op == GGML_OP_MUL_MAT_ID) {
+            if (!d.moe) return false;
             const int Lg = layer_of(t->src[0]->name, "ffn_gate_exps"), Ld = d.down ? layer_of(t->src[0]->name, "ffn_down_exps") : -1;
             const int L = Lg >= 0 ? Lg : Ld;
             if (debug && seen[t->src[0]->name]++ == 0)
@@ -88,6 +149,7 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
             return L >= d.lo && L <= d.hi;
         }
         if (!strncmp(t->name, "ffn_moe_weights", 15)) {   // the routing weights: raw, after normalization, after scaling
+            if (!d.moe) return false;
             int L = -1; char tail[32] = {0};
             if (sscanf(t->name, "ffn_moe_weights-%d%31s", &L, tail) < 1 || tail[0]) {
                 if (sscanf(t->name, "ffn_moe_weights_norm-%d%31s", &L, tail) < 1 || tail[0]) {
@@ -99,6 +161,49 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
             return true;
         }
         return false;
+    }
+    if (t->op == GGML_OP_MUL_MAT) {   // a dense weight's input (the ask phase checked the name)
+        std::string sn;
+        const int L = dense_of(t->src[0]->name, sn);
+        std::string wname = "blk." + std::to_string(L) + "." + sn + ".weight";
+        const ggml_tensor * src1 = t->src[1];
+        auto it = d.dense_seen.find(src1);
+        if (it != d.dense_seen.end()) {   // another weight on the same input: share its file
+            if (!d.dense_weight.count(wname)) d.dense_weight[wname] = it->second;
+            return true;
+        }
+        std::string fname;
+        auto wit = d.dense_weight.find(wname);
+        fname = wit != d.dense_weight.end() ? wit->second : "blk." + std::to_string(L) + ".din." + sn + ".bf16";
+        d.dense_weight[wname] = fname;
+        d.dense_seen[src1] = fname;
+        const int64_t ne0 = src1->ne[0], ne1 = src1->ne[1], ne2 = src1->ne[2], ne3 = src1->ne[3];
+        const bool batched = t->src[0]->ne[2] > 1 && ne2 == t->src[0]->ne[2];   // grouped weight [ne0, rank, groups]
+        if (src1->nb[0] != ggml_type_size(src1->type) || ggml_blck_size(src1->type) != 1) {
+            fprintf(stderr, "%s: input '%s' is not row-contiguous (%s): not dumped\n", wname.c_str(), src1->name, ggml_type_name(src1->type));
+            return true;
+        }
+        get_tensor(src1, d.buf);
+        const auto * tr = ggml_get_type_traits(src1->type);
+        std::vector<float> row(ne0);
+        std::vector<uint16_t> out;
+        out.reserve((size_t) ne0 * ne1 * ne2 * ne3);
+        auto put = [&](int64_t i1, int64_t i2, int64_t i3) {
+            const char * p = d.buf.data() + i1 * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3];
+            if (src1->type == GGML_TYPE_F32) memcpy(row.data(), p, ne0 * sizeof(float));
+            else if (tr && tr->to_float) tr->to_float(p, row.data(), ne0);
+            else { fprintf(stderr, "%s: input type %s not readable\n", wname.c_str(), ggml_type_name(src1->type)); exit(1); }
+            const size_t at = out.size();
+            out.resize(at + ne0);
+            ggml_fp32_to_bf16_row_ref(row.data(), (ggml_bf16_t *) out.data() + at, ne0);
+        };
+        if (batched) { for (int64_t i3 = 0; i3 < ne3; ++i3) for (int64_t i1 = 0; i1 < ne1; ++i1) for (int64_t i2 = 0; i2 < ne2; ++i2) put(i1, i2, i3); }
+        else         { for (int64_t i3 = 0; i3 < ne3; ++i3) for (int64_t i2 = 0; i2 < ne2; ++i2) for (int64_t i1 = 0; i1 < ne1; ++i1) put(i1, i2, i3); }
+        fwrite(out.data(), 2, out.size(), d.file(fname));
+        DenseFile & df = d.dense_files[fname];
+        df.file = fname; df.ne0 = ne0; df.groups = batched ? ne2 : 1;
+        df.rows += batched ? ne1 * ne3 : ne1 * ne2 * ne3;
+        return true;
     }
     if (t->op != GGML_OP_MUL_MAT_ID) {   // a weights node: [1, n_ids, n_tokens] or [n_ids, n_tokens] f32
         const char * dash = strrchr(t->name, '-');
@@ -157,7 +262,8 @@ static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
 
 int main(int argc, char ** argv) {
     std::vector<const char *> args;
-    int nt = 16, n_ctx = 2048, ub = 8192, max_chunks = 0;
+    int nt = 16, n_ctx = 2048, ub = 8192, max_chunks = 0, dense_chunks = 0;
+    std::string dense_re;
     bool gpu = false;
     Dump d;
     for (int i = 1; i < argc; ++i) {
@@ -167,15 +273,21 @@ int main(int argc, char ** argv) {
         else if (!strncmp(argv[i], "--chunks=", 9)) max_chunks = atoi(argv[i] + 9);
         else if (!strncmp(argv[i], "--layers=", 9)) { d.lo = atoi(argv[i] + 9); const char * p = strchr(argv[i] + 9, '-'); d.hi = p ? atoi(p + 1) : d.lo; }
         else if (!strcmp(argv[i], "--dump-down")) d.down = true;
+        else if (!strcmp(argv[i], "--dense")) { d.dense = true; dense_re = DENSE_DEFAULT; }
+        else if (!strncmp(argv[i], "--dense=", 8)) { d.dense = true; dense_re = argv[i] + 8; }
+        else if (!strncmp(argv[i], "--dense-chunks=", 15)) dense_chunks = atoi(argv[i] + 15);
+        else if (!strcmp(argv[i], "--no-moe")) d.moe = false;
         else if (!strcmp(argv[i], "--gpu")) gpu = true;
         else args.push_back(argv[i]);
     }
     if (args.size() != 3) {
         fprintf(stderr, "usage: hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] "
-                        "[--chunks=N] [--dump-down] [--layers=a-b]\n");
+                        "[--chunks=N] [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe]\n");
         return 2;
     }
     d.dir = args[2];
+    if (d.dense) d.dense_re = std::regex(dense_re);
+    if (!d.moe && !d.dense) { fprintf(stderr, "--no-moe without --dense: nothing to dump\n"); return 2; }
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -210,6 +322,9 @@ int main(int argc, char ** argv) {
     for (int c0 = 0; c0 < n_chunk; c0 += n_seq) {
         const int ns = std::min(n_seq, n_chunk - c0);
         llama_memory_clear(llama_get_memory(ctx), true);
+        d.dense_active = d.dense && (dense_chunks <= 0 || c0 < dense_chunks);
+        d.dense_seen.clear();
+        if (!d.moe && !d.dense_active) break;   // (a dense-only pass past its chunks: done)
         b.n_tokens = 0;
         for (int s = 0; s < ns; ++s)
             for (int k = 0; k < n_ctx; ++k) {
@@ -230,6 +345,16 @@ int main(int argc, char ** argv) {
     for (auto & kv : d.wname) fprintf(f, " %d:%s", kv.first, kv.second.c_str());
     fprintf(f, "\n");
     fclose(f);
+    if (d.dense) {
+        FILE * g = fopen((d.dir + "/dense.txt").c_str(), "w");
+        fprintf(g, "# weight file ne0 groups rows (tools/hessian_dump --dense; regex %s, dense chunks %d)\n", dense_re.c_str(), dense_chunks);
+        for (auto & kv : d.dense_weight) {
+            const DenseFile & df = d.dense_files[kv.second];
+            fprintf(g, "%s %s %lld %lld %lld\n", kv.first.c_str(), kv.second.c_str(), (long long) df.ne0, (long long) df.groups, (long long) df.rows);
+        }
+        fclose(g);
+        printf("dense: %zu weights, %zu input files\n", d.dense_weight.size(), d.dense_files.size());
+    }
     printf("wrote %lld rows a layer for %zu layers to %s\n", (long long) rows, d.rows.size(), d.dir.c_str());
     llama_batch_free(b);
     llama_free(ctx);

@@ -14,6 +14,7 @@ blk.L.gsum2.npy, and *_g.npy when the dump has the routing weights), for small m
 --recompute ignores blk.L.a.bf16 and recomputes anyway (a check of the two against each other).
 """
 import os
+import re
 import sys
 
 import numpy as np
@@ -102,8 +103,10 @@ class DumpHessians:
         H = self._xtx(self._x_chunks(d, tok, g), d.n_embd)
         return H.cpu().numpy(), len(tok)
 
-    def hessian_mid(self, L, e, Wg=None, Wu=None, gated=False):
-        """(H_mid [n_ff, n_ff] float64 numpy, n rows). Wg, Wu: float32 [n_ff, n_embd] (needed without blk.L.a)."""
+    def hessian_mid(self, L, e, Wg=None, Wu=None, gated=False, clamp=0.0):
+        """(H_mid [n_ff, n_ff] float64 numpy, n rows). Wg, Wu: float32 [n_ff, n_embd] (needed without blk.L.a).
+        clamp > 0: the model's SwiGLU limit (DeepSeek V4 / V4.1 swiglu_clamp_exp, llama.cpp's ggml_swiglu_clamp):
+        a = silu(min(g, clamp)) * clamp(u, -clamp, clamp) in the recompute."""
         torch = self.torch
         d = self.layer(L)
         tok, slot = d.rows(e)
@@ -121,7 +124,10 @@ class DumpHessians:
                 wg = torch.from_numpy(np.ascontiguousarray(Wg)).to(self.device)
                 wu = torch.from_numpy(np.ascontiguousarray(Wu)).to(self.device)
                 for xc in self._x_chunks(d, tok, None):
-                    ac = torch.nn.functional.silu(xc @ wg.T) * (xc @ wu.T)
+                    gx, ux = xc @ wg.T, xc @ wu.T
+                    if clamp and clamp > 0:
+                        gx, ux = torch.clamp(gx, max=clamp), torch.clamp(ux, -clamp, clamp)
+                    ac = torch.nn.functional.silu(gx) * ux
                     if g is not None:
                         pass   # (handled below: scale rows)
                     yield ac
@@ -135,6 +141,67 @@ class DumpHessians:
         else:
             H = self._xtx(gen(), n_ff)
         return H.cpu().numpy(), len(tok)
+
+
+class DenseHessians:
+    """Hessians of the dense (2-D, and grouped 3-D) tensors from a tools/hessian_dump --dense dump: dense.txt maps a
+    weight to its input file blk.L.din.<name>.bf16 ([rows][groups][ne0] bf16); H = sum x x^T over the rows (per group
+    for a grouped weight such as DeepSeek V4's attn_output_a). The shared experts' gate/up and the router read the MoE
+    input, so without a din file of their own they take blk.L.x.bf16 (all dumped tokens, or the first max_rows).
+    The H of one input file is kept until another file is asked for (weights sharing an input share the work)."""
+
+    IMPLICIT = re.compile(r"^blk\.(\d+)\.(ffn_gate_shexp|ffn_up_shexp|ffn_gate_inp)\.weight$")
+
+    def __init__(self, ddir, device="cpu", chunk=8192, max_rows=0):
+        import torch
+        self.torch, self.ddir, self.device, self.chunk, self.max_rows = torch, ddir, device, chunk, max_rows
+        self.map = {}   # weight -> (file, ne0, groups)
+        p = os.path.join(ddir, "dense.txt")
+        if os.path.exists(p):
+            for line in open(p):
+                if line.startswith("#") or not line.strip():
+                    continue
+                w, f, ne0, g, _rows = line.split()
+                self.map[w] = (f, int(ne0), int(g))
+        info = os.path.join(ddir, "info.txt")
+        self.n_embd = 0
+        if os.path.exists(info):
+            kv = dict(line.split(None, 1) for line in open(info) if " " in line.strip())
+            self.n_embd = int(kv.get("n_embd", "0"))
+        self.cache_file, self.cache = None, None
+
+    def _entry(self, name):
+        if name in self.map:
+            return self.map[name]
+        m = self.IMPLICIT.match(name)
+        if m and self.n_embd and os.path.exists(os.path.join(self.ddir, "blk.%s.x.bf16" % m.group(1))):
+            return ("blk.%s.x.bf16" % m.group(1), self.n_embd, 1)
+        return None
+
+    def has(self, name):
+        return self._entry(name) is not None
+
+    def groups(self, name):
+        return self._entry(name)[2]
+
+    def file(self, name):
+        return self._entry(name)[0]
+
+    def hessian(self, name, g=0):
+        """(H [ne0, ne0] float64 numpy, n rows) of group g"""
+        f, ne0, G = self._entry(name)
+        if self.cache_file != f:
+            torch = self.torch
+            x = np.memmap(os.path.join(self.ddir, f), dtype=np.uint16, mode="r").reshape(-1, G, ne0)
+            n = x.shape[0] if not self.max_rows else min(x.shape[0], self.max_rows)
+            H = torch.zeros(G, ne0, ne0, dtype=torch.float64, device=self.device)
+            for c0 in range(0, n, self.chunk):
+                u = torch.from_numpy(np.ascontiguousarray(x[c0:min(n, c0 + self.chunk)]).view(np.int16)).to(self.device)
+                xc = ((u.to(torch.int32) & 0xFFFF) << 16).view(torch.float32)   # [c, G, ne0]
+                H += torch.einsum("cgi,cgj->gij", xc, xc).double()
+            self.cache_file, self.cache = f, (H.cpu().numpy(), n)
+        H, n = self.cache
+        return H[g], n
 
 
 def main():
