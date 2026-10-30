@@ -77,11 +77,17 @@ class DumpHessians:
             H += (xc.T @ xc).double()
         return H
 
+    def _bf16(self, u16):
+        """bf16 rows (uint16 numpy) -> float32 tensor on the device (the shift runs on the device)"""
+        torch = self.torch
+        x = torch.from_numpy(np.ascontiguousarray(u16).view(np.int16)).to(self.device)
+        return ((x.to(torch.int32) & 0xFFFF) << 16).view(torch.float32)
+
     def _x_chunks(self, d, tok, gated):
         torch = self.torch
         for c0 in range(0, len(tok), self.chunk):
             t = tok[c0:c0 + self.chunk]
-            xc = torch.from_numpy(bf16_to_f32(np.asarray(d.x[np.sort(t)]))).to(self.device)
+            xc = self._bf16(np.asarray(d.x[t]))
             if gated is not None:
                 xc = xc * torch.from_numpy(gated[c0:c0 + self.chunk]).to(self.device)[:, None]
             yield xc
@@ -107,7 +113,7 @@ class DumpHessians:
             if d.a is not None and not self.recompute:
                 for c0 in range(0, len(tok), self.chunk):
                     t, s = tok[c0:c0 + self.chunk], slot[c0:c0 + self.chunk]
-                    ac = torch.from_numpy(bf16_to_f32(np.asarray(d.a[t, s]))).to(self.device)
+                    ac = self._bf16(np.asarray(d.a[t, s]))
                     if g is not None:
                         ac = ac * torch.from_numpy(g[c0:c0 + self.chunk]).to(self.device)[:, None]
                     yield ac
