@@ -48,6 +48,8 @@ class LayerDump:
         self.n_expert = len(self.bounds) - 1
 
     def rows(self, e):
+        if e + 1 >= len(self.bounds):   # (an expert no token was routed to, above the largest id seen)
+            return self.tok[:0], self.slot[:0]
         s = slice(self.bounds[e], self.bounds[e + 1])
         return self.tok[s], self.slot[s]
 
@@ -117,13 +119,15 @@ class DumpHessians:
                     if g is not None:
                         pass   # (handled below: scale rows)
                     yield ac
+        # the down input's width: from the dump when it has blk.L.a (info.txt n_ff), else from the gate weights
+        n_ff = d.n_ff if (d.a is not None and not self.recompute) else int(Wg.shape[0])
         if (d.a is None or self.recompute) and g is not None:   # gated recompute: scale after the nonlinearity
             def gen2():
                 for i, ac in enumerate(gen()):
                     yield ac * torch.from_numpy(g[i * self.chunk:(i + 1) * self.chunk]).to(self.device)[:, None]
-            H = self._xtx(gen2(), d.n_ff)
+            H = self._xtx(gen2(), n_ff)
         else:
-            H = self._xtx(gen(), d.n_ff)
+            H = self._xtx(gen(), n_ff)
         return H.cpu().numpy(), len(tok)
 
 

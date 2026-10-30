@@ -113,6 +113,7 @@ def fit_type(typ, ne0):
 
 
 LDLQ_TYPES = {Q.IQ1_S, Q.IQ1_M, Q.IQ2_XXS, Q.IQ2_XS, Q.IQ2_S, Q.IQ3_XXS, Q.IQ3_S, Q.IQ4_XS}   # super-block = 256
+MIN_ROWS = int(os.environ.get("LDLQ_MIN_ROWS", 64))   # an expert with fewer calibration rows is rounded plain
 
 
 def hess_file(hess_dir, name, gated):
@@ -450,6 +451,8 @@ def main() -> int:
                                                              feedback=hess_opt["feedback"])
                     return out_b.reshape(-1)
 
+                fell_back = []   # experts quantized plain: no (or too few) calibration rows for a Hessian
+
                 def one_ldlq(e):
                     if t.name in stash:
                         dst[e] = stash[t.name][e]
@@ -461,9 +464,20 @@ def main() -> int:
                         U, perm, diag_n, dead = hess_cache[e]
                     else:
                         H, n = get_H(e)
-                        U, perm, diag_n, dead = factor(H, n)
+                        if n < MIN_ROWS:   # (plain rounding, as without a Hessian: the imatrix row still applies)
+                            fell_back.append((e, int(n)))
+                            U = perm = diag_n = dead = None
+                        else:
+                            U, perm, diag_n, dead = factor(H, n)
                         if share_key is not None and partner is None:
                             hess_cache[e] = (U, perm, diag_n, dead)
+                    if U is None:
+                        dst[e] = ldlq.quantize_matrix(W, quant_blk, dequant_blk, tsize, imatrix=im[e], feedback=False)[0].reshape(-1)
+                        if partner is not None:
+                            Wp_ = src_shards.dequant_expert(partner[0], e)
+                            stash[partner[0]][e] = ldlq.quantize_matrix(Wp_, quant_blk, dequant_blk, tsize, imatrix=imat[partner[0]][e],
+                                                                        feedback=False)[0].reshape(-1)
+                        return per
                     dst[e] = ldlq_one_matrix(W, U, perm, diag_n, im[e])
                     if partner is not None:
                         Wp_ = src_shards.dequant_expert(partner[0], e)
@@ -510,8 +524,10 @@ def main() -> int:
             w.write_tensor_data(dst.reshape((ne2, ne1, per // ne1) if len(t.shape) == 3 else (ne1, per // ne1)),
                                 tensor_endianess=r.endianess)
             stash.pop(t.name, None)
-            print("  %s -> %s in %.0f s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",
-                                                 " (ldlq %s)" % hess if hess is not None else ""),
+            print("  %s -> %s in %.0f s%s%s%s" % (t.name, new_type.name, time.time() - t0, " (gpu)" if gpu_dq else " (gpu quant, cpu dequant)" if on_gpu else "",
+                                                   " (ldlq %s)" % hess if hess is not None else "",
+                                                   "" if hess is None or not fell_back else " [%d experts plain: fewer than %d rows, e.g. %s]" % (
+                                                       len(fell_back), MIN_ROWS, ", ".join("%d:%d" % fb for fb in fell_back[:4]))),
                   flush=True)
         w.close()
     print("re-quantized %.2f GiB -> %.2f GiB%s" % (total_old / 2**30, total_new / 2**30, " (check only)" if check else ""))
