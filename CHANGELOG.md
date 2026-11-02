@@ -21,6 +21,9 @@ with the steps in the README (LDLQ walkthrough).
 - CUDA checked on an RTX 5090: the self-test is byte-identical for all 9 types and the 4 GPU-read sources.
 - `setup.sh --torch-gpu [--torch-index cu130|rocm7.2]`: the converter's torch version built for the GPU.
 - `tools/gguf_set_split_no.py`, `recipes/deepseek-v4.1-1017-ldlq/` (the 132G / 139G rules files).
+- `hessian_dump` makes its out dir, and when llama.cpp prunes the last layer to the output rows (OLMoE, Qwen MoE) it
+  starts again with a logit for every token (`--all-logits`); `requant_experts.py` stops on a `--dump` without
+  `info.txt` instead of rounding plain with no word.
 
 ## v0.2.1 - 2026-10-30
 
