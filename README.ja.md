@@ -7,14 +7,14 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
-![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
-![Version](https://img.shields.io/badge/version-0.2.1-555)
+![CUDA](https://img.shields.io/badge/CUDA-checked-76B900?logo=nvidia&logoColor=white)
+![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700%20%7C%20RTX%205090-ED1C24)
+![Version](https://img.shields.io/badge/version-0.3.0-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 [English](README.md) · **日本語**
 
-[はじめかた](#-はじめかた) · [実例](#-実例-deepseek-v41-flash-を一から作る) · [使い方](#️-使い方) · [速さ](#-速さ) · [仕組み](#-仕組み) · [制限](#️-制限) ·
+[はじめかた](#-はじめかた) · [実例](#-実例-deepseek-v41-flash-を一から作る) · [LDLQ](#-ldlq-の実例公開している-deepseek-v41-ldlq-132g--139g-を作る) · [使い方](#️-使い方) · [速さ](#-速さ) · [仕組み](#-仕組み) · [制限](#️-制限) ·
 [謝辞](#-謝辞)
 
 </div>
@@ -45,6 +45,10 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
   - 1 層を量子化し直した GGUF も、`cmp` でまったく同じでした。
 - **CPU 32 スレッドの 5 倍、1 スレッドの 50〜100 倍**
   - エキスパート 384 個のテンソル 1 本が、27 秒から約 5 秒になりました。
+- **LDLQ：形式はそのまま、丸め方だけ良くする**
+  - `tools/hessian_dump` で、各エキスパートに実際に入ってくる入力を記録します。
+  - `requant_experts.py --dump=` が、256 個ずつのブロックを丸めるたびに、その誤差を後のブロックへ回します（GPTQ の考え方を ggml 自身の量子化関数に組み合わせたもの）。GPU で動きます。
+  - 型も大きさも変わらないので、どの llama.cpp でも読めます。DeepSeek V4.1 を unsloth UD-IQ1_M と同じ割り振りで作ると、KL が 0.404（普通の丸め）から 0.194 になりました（UD-IQ1_M は 0.198）。[実例](#-ldlq-の実例公開している-deepseek-v41-ldlq-132g--139g-を作る)
 - **エキスパートだけ量子化し直す（`tools/requant_experts.py`）**
   - 元にできるのは、ggml が読める GGUF なら何でもかまいません（MXFP4、i-quant、k-quant）。
   - 正規表現の規則ファイルに従い、imatrix を使って MoE のエキスパートだけを量子化し直します。
@@ -88,6 +92,7 @@ source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 | `--llama-gpu-build <フォルダ>` | 手元にある ROCm / CUDA 版の llama.cpp を使う（直しが無いと、メモリより大きいモデルの GPU での imatrix が止まります） |
 | `--backend hip\|cuda`、`--arch gfx1201\|sm_120` | GPU の自動判別を上書きする |
 | `--ref <git の ref>` | llama.cpp の版を固定する |
+| `--torch-gpu`（`--torch-index cu130\|rocm7.2`） | CPU 版の代わりに GPU 版の torch を入れる（LDLQ を GPU で回すため。数 GB 増えます） |
 
 ### 必要なもの
 
@@ -95,8 +100,8 @@ source ~/trench-gguf/trench.env    # 新しいターミナルを開くたびに
 | --- | --- |
 | Linux x86-64 | Ubuntu、glibc 2.39 |
 | git、cmake、C コンパイラ、venv が使える Python 3 | Ubuntu 標準のもの |
-| ROCm（`hipcc`、`rocminfo`）**または** CUDA（`nvcc`、`nvidia-smi`） | HIP 7.15（ROCm 10 / TheRock）。CUDA 13.3 はビルドのみ |
-| GPU | AI PRO R9700（gfx1201）。RTX 50 系（sm_120）は CUDA 12.8 以降 |
+| ROCm（`hipcc`、`rocminfo`）**または** CUDA（`nvcc`、`nvidia-smi`） | HIP 7.15（ROCm 10 / TheRock）。CUDA 13（RTX 5090） |
+| GPU | AI PRO R9700（gfx1201）、RTX 5090（sm_120。RTX 50 系は CUDA 12.8 以降） |
 | GPU のメモリ | 数百 MB（量子化）。imatrix と GPU での品質チェックは、モデルの密な部分 + 数 GB |
 | ツールのディスク | 約 3 GB（llama.cpp 2 つで 1.2 GB、CPU 版 torch 入りの Python venv で 1.3 GB） |
 
@@ -212,6 +217,120 @@ ls -lh mix
 | `hf: command not found`、`python: ... numpy` | そのターミナルで `source ~/trench-gguf/trench.env` を流す |
 | `gpuq_init failed` | GPU が見えていない。`rocminfo` か `nvidia-smi` に GPU が出るか確かめ、`./setup.sh` をもう一度流す |
 | `setup.sh` の自己テストで `MISMATCH` | `--gpu` を使わない。`setup-test.log` を付けて issue を立てる |
+
+## 🎯 LDLQ の実例：公開している DeepSeek V4.1 LDLQ 132G / 139G を作る
+
+[zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)
+を、同じ手順・同じ設定で作り直します。
+
+**LDLQ とは**
+- ファイルの形式も大きさも変えずに、重みの「丸め方」だけを変える方法です（GPTQ の考え方を、ggml 自身の量子化関数に組み合わせたもの）。
+- 256 個ずつのブロックを丸めるたびに、その誤差をまだ丸めていないブロックへ回します。
+- どう回すかは、モデルに実際に入ってくる入力の形（エキスパートごとの Hessian）で決めます。そのために、入力をいったんダンプして使います。
+
+**効果**（unsloth UD-IQ1_M とまったく同じ型・同じ大きさで比べたもの。エキスパート 132.2 GB、8 シーケンスの KL）
+
+| 作り方 | KL |
+| --- | --- |
+| LDLQ（今回の手順） | 0.194 |
+| unsloth UD-IQ1_M | 0.198 |
+| 普通の丸め（同じ型） | 0.404 |
+
+コマンドはすべて、そのまま動きます。作業フォルダは最初の実例と同じです。時間は RTX 5090（32 GB）、RAM 94 GB での実測です。GPU の浮動小数点計算でダンプを取るため、出来上がるバイトは私たちのものと完全には一致しません。品質は同じになるはずです。
+
+| 必要なもの | 量 |
+| --- | --- |
+| ディスクの空き | **約 1.5 TB**（ダウンロード 2 つで 802 GB、ダンプ 204 GB、出力 2 つで 290 GB、コピー 48 GB） |
+| GPU | 24〜32 GB（ダンプのとき、モデルの密な部分を GPU で動かすため） |
+| 時間 | ダンプ 49 分、量子化し直し 77 分 + 9 分、組み込み 3 分 |
+
+**手順 0：GPU 版 torch 入りでセットアップする**
+- LDLQ のループは GPU で動きます。普通の `./setup.sh` で入る torch は CPU 版だけなので、`--torch-gpu` を付けます。
+- `tools/hessian_dump` もこのときにビルドされます。
+
+```bash
+cd ~/trench-gguf
+git pull
+./setup.sh --torch-gpu
+source ~/trench-gguf/trench.env
+```
+
+**手順 1：元になるファイルをダウンロードする**
+- 最初の実例と同じ、unsloth の UD-Q4_K_XL と imatrix を使います。
+- それに加えて UD-IQ2_XXS も落とします。新しいエキスパートを差し込む土台で、密な部分と Engram 表はそのまま使います。
+
+```bash
+cd ~/gguf-work/DeepSeek-V4.1
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-Q4_K_XL/*" --include "UD-IQ2_XXS/*" --include "imatrix_unsloth.gguf_file"
+```
+
+**手順 2：校正用の文章を作る**
+- 英語・日本語の文章とコードで、約 100 万トークンです。
+- 公開データセットの、版を固定したものから作ります。
+
+```bash
+python ~/trench-gguf/tools/imatrix.py calib calib-1m.txt --size=small --scale=7
+```
+
+**手順 3：llama.cpp が読める形に並べ替える**
+- UD-Q4_K_XL の 8 本目のシャード（Engram 表）は、この llama.cpp が知らない型で書かれています。
+- そこで、6 番目の位置に UD-IQ2_XXS の Engram シャードを置き、元の 6 本目を 8 番目の位置へ移します。
+- ハードリンクなので場所は取りません。ヘッダーを書き換える 6 本目だけはコピーします（48 GB）。
+
+```bash
+mkdir -p view
+S=UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL
+for k in 1 2 3 4 5 7 9; do ln -f $S-0000$k-of-00009.gguf view/q4-0000$k-of-00009.gguf; done
+cp $S-00006-of-00009.gguf view/q4-00008-of-00009.gguf
+python ~/trench-gguf/tools/gguf_set_split_no.py view/q4-00008-of-00009.gguf 7
+ln -f UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf view/q4-00006-of-00009.gguf
+```
+
+**手順 4：ダンプする**（49 分、204 GB）
+- 491,520 トークン分の、全層のエキスパートへの入力を書き出します。
+- GPU のメモリが足りないと言われたら、`--ub=8192` にしてください。
+
+```bash
+~/trench-gguf/tools/hessian_dump view/q4-00001-of-00009.gguf calib-1m.txt dump \
+  --gpu --threads=16 --ctx=2048 --ub=16384 --chunks=240
+```
+
+**手順 5：LDLQ で量子化し直す**（77 分と 9 分）
+- 規則ファイルは trench-gguf に入っています。
+  - 132G：unsloth UD-IQ1_M と同じエキスパートの割り振りです。
+  - 139G：層 35〜39 を IQ3_XXS で作り直します。
+- `--only-matched` を付けると、新しく作ったエキスパートのテンソルだけを書き出します。
+- `--dump-device=cuda` は名前に関係なく、ROCm の GPU でもこのままで動きます。
+
+```bash
+R=~/trench-gguf/recipes/deepseek-v4.1-1017-ldlq
+for v in 132G:rules-132G.txt 139G:rules-139G-layers35-39.txt; do
+  python ~/trench-gguf/tools/requant_experts.py \
+    UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ldlq-${v%%:*} $R/${v#*:} \
+    --imatrix=imatrix_unsloth.gguf_file --gpu --threads=12 --only-matched \
+    --dump=dump --dump-device=cuda --order=act --damp=0.3 --damp-iq1=1.0
+done
+```
+
+**手順 6：UD-IQ2_XXS に差し込む**（3 分）
+- 新しいエキスパートを、1 バイトも変えずに差し込みます。
+- 新しいテンソルが入らないシャードは、ハードリンクで済ませます。
+
+```bash
+python ~/trench-gguf/tools/merge_experts.py \
+  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  ldlq-132G/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf 132G DeepSeek-V4.1-Flash-1017-LDLQ-132G 0-39
+python ~/trench-gguf/tools/merge_experts.py \
+  132G/DeepSeek-V4.1-Flash-1017-LDLQ-132G-00001-of-00006.gguf \
+  ldlq-139G/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf 139G DeepSeek-V4.1-Flash-1017-LDLQ-139G 35-39
+ls -lh 132G 139G
+```
+
+**できあがり**
+- `132G/` と `139G/` が、公開している 2 つの版です。どちらも 6 シャードで、Engram のシャードは共有です。
+- ダンプと `view/` は消して構いません：`rm -rf dump view`
+- 品質を比べるときは、[`tools/teacher`](#基準と比べて品質を確かめる) を使います。
 
 ## 🧩 対応するモデル
 
@@ -400,7 +519,8 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
 - **型**：GPU で計算するのは IQ1_S、IQ1_M、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ3_S、IQ4_XS、IQ4_NL です。k-quant（Q2_K〜Q6_K）は、ggml を通して CPU で計算します。元の重みを GPU で float に戻せるのは、F32、F16、BF16、Q8_0、MXFP4 です。
 - **モデル**：MoE のエキスパートだけが対象です。代わりの型になるテンソルとその理由は、[対応するモデル](#-対応するモデル)を見てください。
-- **CUDA**：ビルドはできますが、NVIDIA の GPU での一致はまだ確かめていません。
+- **CUDA**：RTX 5090（sm_120、CUDA 13）で確かめました。9 つの型すべてと、GPU で読む元の型が ggml とバイト単位で一致し、LDLQ のループのテストも通ります。
+- **LDLQ**：GPU で回すには、GPU 版の torch が要ります（`./setup.sh --torch-gpu`）。無い場合は `--dump-device=cpu` で同じ処理を CPU で回せますが、かなり遅くなります。校正データで 64 行に満たないエキスパートは、普通の丸めになります。
 - **環境**：確かめたのは x86-64 の Linux だけです。
   - ARM では gcc がふつうに FMA を使うので、ggml の CPU の出力そのものが変わります。
   - Windows では、MSVC の `qsort` が同じ値の順番を変える可能性があります。
@@ -414,7 +534,6 @@ GPU の時間の約半分は、float の重みを PCIe で送る時間です。
 
 ## 🗺️ 今後の予定
 
-- RTX 5090 での CUDA 版の一致の確認
 - PCIe の転送と GPU の計算を重ねる
 - GPU がない人向けに、ggml と一致したまま CPU 版を速くする（符号帳の探索を SIMD のレーンで並べる）
 

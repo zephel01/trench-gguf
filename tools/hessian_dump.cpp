@@ -43,6 +43,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <regex>
@@ -286,6 +287,11 @@ int main(int argc, char ** argv) {
         return 2;
     }
     d.dir = args[2];
+    {   // the out dir is made here (a missing one used to fail at the first write, after the model had loaded)
+        std::error_code ec;
+        std::filesystem::create_directories(d.dir, ec);
+        if (ec) { fprintf(stderr, "cannot create %s: %s\n", d.dir.c_str(), ec.message().c_str()); return 1; }
+    }
     if (d.dense) d.dense_re = std::regex(dense_re);
     if (!d.moe && !d.dense) { fprintf(stderr, "--no-moe without --dense: nothing to dump\n"); return 2; }
     llama_backend_init();

@@ -254,6 +254,12 @@ def main() -> int:
     if hess_dir or dump_dir or dense_dir:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import ldlq
+    for d_, what in ((dump_dir, "--dump"), (dense_dir, "--dense-dump")):
+        # a dump without info.txt is missing or unfinished: without this check every tensor would be rounded plain
+        # with no word (the bytes of a run without --dump)
+        if d_ and not os.path.isfile(os.path.join(d_, "info.txt")):
+            print("%s=%s: no info.txt there - not a finished tools/hessian_dump output" % (what, d_), file=sys.stderr)
+            return 2
     if dump_dir:
         from hessian_from_dump import DumpHessians
         dump = DumpHessians(dump_dir, dump_device if dump_device != "numpy" else "cpu")

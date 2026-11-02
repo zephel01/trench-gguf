@@ -7,14 +7,14 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
 ![ROCm](https://img.shields.io/badge/ROCm-checked-ED1C24?logo=amd&logoColor=white)
-![CUDA](https://img.shields.io/badge/CUDA-builds%20(unchecked)-76B900?logo=nvidia&logoColor=white)
-![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700-ED1C24)
-![Version](https://img.shields.io/badge/version-0.2.1-555)
+![CUDA](https://img.shields.io/badge/CUDA-checked-76B900?logo=nvidia&logoColor=white)
+![GPU](https://img.shields.io/badge/tested-AI%20PRO%20R9700%20%7C%20RTX%205090-ED1C24)
+![Version](https://img.shields.io/badge/version-0.3.0-555)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-ac8e1694d-4D6BFE)
 
 **English** · [日本語](README.ja.md)
 
-[Quick start](#-quick-start) · [Walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step) · [Usage](#️-usage) · [Performance](#-performance) · [How it works](#-how-it-works) ·
+[Quick start](#-quick-start) · [Walkthrough](#-walkthrough-deepseek-v41-flash-step-by-step) · [LDLQ](#-ldlq-walkthrough-the-published-deepseek-v41-ldlq-132g--139g) · [Usage](#️-usage) · [Performance](#-performance) · [How it works](#-how-it-works) ·
 [Limits](#️-limits) · [Credits](#-credits)
 
 </div>
@@ -42,6 +42,10 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
 - **The source is read on the GPU too** — MXFP4 / Q8_0 / F16 / BF16 / F32 experts go to the GPU as they are stored
   (1/8 to 1/2 of the bytes of floats) and are dequantized there, bit for bit as ggml does.
 - **5x a 32-thread CPU, 50-100x one thread** — one 384-expert tensor in about 5 s instead of 27 s.
+- **LDLQ: better rounding, same format** — `tools/hessian_dump` records what each expert really sees, and
+  `requant_experts.py --dump=` rounds each 256-weight block with the error of the earlier ones fed forward (GPTQ's idea
+  around ggml's own quantizers), on the GPU. Same types, same bytes, any llama.cpp reads it: DeepSeek V4.1 at unsloth
+  UD-IQ1_M's exact layout went from KL 0.404 (plain) to 0.194 (UD-IQ1_M: 0.198). [Walkthrough](#-ldlq-walkthrough-the-published-deepseek-v41-ldlq-132g--139g).
 - **Re-quantize the experts only** — `tools/requant_experts.py` takes any GGUF ggml can read (MXFP4, i-quants,
   k-quants), re-quantizes the MoE experts per a regex rules file with an imatrix, and copies everything else as is.
 - **From the original weights in one go** — `tools/convert_hf.py` turns a Hugging Face model (safetensors, BF16 /
@@ -76,6 +80,7 @@ source ~/trench-gguf/trench.env    # in every new terminal
 | `--llama-gpu-build <folder>` | use a ROCm/CUDA build of llama.cpp you already have (without the patch, the GPU imatrix of a model bigger than RAM stalls) |
 | `--backend hip\|cuda`, `--arch gfx1201\|sm_120` | override the GPU detection |
 | `--ref <git ref>` | pin llama.cpp |
+| `--torch-gpu` (`--torch-index cu130\|rocm7.2`) | torch for the GPU instead of the CPU (LDLQ's loop on the GPU; a few GB more) |
 
 ### Requirements
 
@@ -83,8 +88,8 @@ source ~/trench-gguf/trench.env    # in every new terminal
 | --- | --- |
 | Linux x86-64 | Ubuntu, glibc 2.39 |
 | git, cmake, a C compiler, Python 3 with venv | Ubuntu's |
-| ROCm (`hipcc`, `rocminfo`) **or** CUDA (`nvcc`, `nvidia-smi`) | HIP 7.15 (ROCm 10 / TheRock); CUDA 13.3 builds |
-| a GPU | AI PRO R9700 (gfx1201); RTX 50 (sm_120) needs CUDA 12.8 or later |
+| ROCm (`hipcc`, `rocminfo`) **or** CUDA (`nvcc`, `nvidia-smi`) | HIP 7.15 (ROCm 10 / TheRock); CUDA 13 (RTX 5090) |
+| a GPU | AI PRO R9700 (gfx1201), RTX 5090 (sm_120; RTX 50 needs CUDA 12.8 or later) |
 | GPU memory | a few hundred MB (quantizing); the dense part of the model plus a few GB (imatrix, quality check on the GPU) |
 | disk for the tool | about 3 GB (llama.cpp twice 1.2 GB, the Python venv with torch for the CPU 1.3 GB) |
 
@@ -195,6 +200,100 @@ Only shard 2 (layers 0-3) is written again (about 49 GB); the other shards are h
 | `hf: command not found` / `python: ... numpy` | run `source ~/trench-gguf/trench.env` in this terminal |
 | `gpuq_init failed` | the GPU is not visible: `rocminfo` or `nvidia-smi` should list it; run `./setup.sh` again |
 | `MISMATCH` in `setup.sh`'s self-test | do not use `--gpu`; open an issue with `setup-test.log` |
+
+## 🎯 LDLQ walkthrough: the published DeepSeek V4.1 LDLQ 132G / 139G
+
+This re-makes [zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF)
+with the same steps and settings. **LDLQ** (error-feedback rounding, GPTQ's idea with ggml's own quantizers) keeps
+the file format and the size as they are and changes only how each weight is rounded: the rounding error of one
+256-weight block is pushed into the blocks not yet rounded, weighted by what the model's real inputs look like (each
+expert's Hessian, from a dump of those inputs). At unsloth UD-IQ1_M's exact types and bytes (132.2 GB of experts) it
+gave KL 0.194 against UD-IQ1_M's 0.198 (8 sequences); plain rounding at the same types gave 0.404.
+
+Every command runs as is, from the work folder of the first walkthrough. Times are an RTX 5090 (32 GB) with 94 GB
+RAM. Your bytes will not be identical to ours (the dump is GPU float math), the quality should be the same.
+
+| What | How much |
+| --- | --- |
+| free disk space | **about 1.5 TB** (the two downloads 802 GB, the dump 204 GB, two outputs 290 GB, a copy 48 GB) |
+| GPU | 24-32 GB (the dump runs the dense part of the model on the GPU) |
+| time | dump 49 min, re-quantization 77 + 9 min, merge 3 min |
+
+**Step 0 — the tool, with torch for the GPU** (the LDLQ loop runs on the GPU; plain `./setup.sh` installs torch for
+the CPU only). This also builds `tools/hessian_dump`.
+
+```bash
+cd ~/trench-gguf
+git pull
+./setup.sh --torch-gpu
+source ~/trench-gguf/trench.env
+```
+
+**Step 1 — the sources.** unsloth's UD-Q4_K_XL and imatrix as in the first walkthrough, plus UD-IQ2_XXS (the base the
+new experts go into; its dense tensors and Engram table are kept as they are).
+
+```bash
+cd ~/gguf-work/DeepSeek-V4.1
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --revision 85f81fb970add013033f25e94006713ca2c0aaf2 \
+  --local-dir . --include "UD-Q4_K_XL/*" --include "UD-IQ2_XXS/*" --include "imatrix_unsloth.gguf_file"
+```
+
+**Step 2 — the calibration text** (~1M tokens of English / Japanese text and code, a pinned public dataset):
+
+```bash
+python ~/trench-gguf/tools/imatrix.py calib calib-1m.txt --size=small --scale=7
+```
+
+**Step 3 — a view llama.cpp can load.** UD-Q4_K_XL's shard 8 (the Engram table) is a type this llama.cpp does not know,
+so the view takes UD-IQ2_XXS's Engram shard at position 6 and moves shard 6 to position 8. Hard links cost no space;
+only shard 6 is copied (48 GB), because its header is edited.
+
+```bash
+mkdir -p view
+S=UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL
+for k in 1 2 3 4 5 7 9; do ln -f $S-0000$k-of-00009.gguf view/q4-0000$k-of-00009.gguf; done
+cp $S-00006-of-00009.gguf view/q4-00008-of-00009.gguf
+python ~/trench-gguf/tools/gguf_set_split_no.py view/q4-00008-of-00009.gguf 7
+ln -f UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf view/q4-00006-of-00009.gguf
+```
+
+**Step 4 — the dump** (49 min, 204 GB): every layer's expert input for 491,520 tokens. If the GPU runs out of memory,
+use `--ub=8192`.
+
+```bash
+~/trench-gguf/tools/hessian_dump view/q4-00001-of-00009.gguf calib-1m.txt dump \
+  --gpu --threads=16 --ctx=2048 --ub=16384 --chunks=240
+```
+
+**Step 5 — LDLQ** (77 min and 9 min). The rules files come with trench-gguf: 132G is UD-IQ1_M's expert layout,
+139G re-makes layers 35-39 at IQ3_XXS. `--only-matched` writes only the new expert tensors.
+
+```bash
+R=~/trench-gguf/recipes/deepseek-v4.1-1017-ldlq
+for v in 132G:rules-132G.txt 139G:rules-139G-layers35-39.txt; do
+  python ~/trench-gguf/tools/requant_experts.py \
+    UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf ldlq-${v%%:*} $R/${v#*:} \
+    --imatrix=imatrix_unsloth.gguf_file --gpu --threads=12 --only-matched \
+    --dump=dump --dump-device=cuda --order=act --damp=0.3 --damp-iq1=1.0
+done
+```
+
+(`--dump-device=cuda` is the GPU on ROCm too.)
+
+**Step 6 — into UD-IQ2_XXS, byte for byte** (3 min; shards without new tensors are hard links):
+
+```bash
+python ~/trench-gguf/tools/merge_experts.py \
+  UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf \
+  ldlq-132G/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf 132G DeepSeek-V4.1-Flash-1017-LDLQ-132G 0-39
+python ~/trench-gguf/tools/merge_experts.py \
+  132G/DeepSeek-V4.1-Flash-1017-LDLQ-132G-00001-of-00006.gguf \
+  ldlq-139G/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf 139G DeepSeek-V4.1-Flash-1017-LDLQ-139G 35-39
+ls -lh 132G 139G
+```
+
+`132G/` and `139G/` are the two published builds (6 shards each, Engram shard shared). The dump and `view/` can go:
+`rm -rf dump view`. To compare the quality, use [`tools/teacher`](#check-the-quality-against-a-reference).
 
 ## 🧩 Supported models
 
@@ -384,7 +483,10 @@ About half of the GPU's time is the float weights crossing PCIe.
 - **Types**: IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL on the GPU; the k-quants (Q2_K ...
   Q6_K) run on the CPU through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
 - **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
-- **CUDA**: builds, but the match has not been checked on an NVIDIA GPU yet.
+- **CUDA**: checked on an RTX 5090 (sm_120, CUDA 13): all 9 types and the GPU-read sources byte-identical, the LDLQ
+  loop's test passes.
+- **LDLQ**: the GPU loop needs torch for your GPU (`./setup.sh --torch-gpu`); without it, `--dump-device=cpu` runs
+  the same loop on the CPU, much slower. Experts with fewer than 64 calibration rows fall back to plain rounding.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;
   on Windows, MSVC's `qsort` may order ties differently. The self-test tells.
 - **llama.cpp version**: ported from bed0a8566 and re-checked on ac8e1694d. Older llama.cpp searches IQ1_M another
@@ -395,7 +497,6 @@ About half of the GPU's time is the float weights crossing PCIe.
 
 ## 🗺️ Roadmap
 
-- the CUDA match on an RTX 5090
 - overlap the PCIe copies with the kernels
 - a faster CPU path that stays byte-identical (the codebook search in SIMD lanes), for machines without a GPU
 

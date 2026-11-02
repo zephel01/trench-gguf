@@ -3,6 +3,25 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
+## v0.3.0 - 2026-11-03
+
+**LDLQ: better rounding at the same types and bytes, on the GPU.** The tools behind
+[zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-LDLQ-32G96G-GGUF),
+with the steps in the README (LDLQ walkthrough).
+
+- `tools/hessian_dump`: one llama.cpp pass over a calibration text writes every layer's expert input, the routing ids
+  and weights (`--dense` also the inputs of the dense tensors). Built by `setup.sh`.
+- `tools/requant_experts.py --dump=<dir>`: error-feedback rounding (GPTQ / block-LDLQ around ggml's own quantizers,
+  `tools/ldlq.py`) with per-expert Hessians from the dump; `--order=act`, `--damp`, `--damp-iq1`, `--dense-dump` for
+  2-D tensors (k-quants too), `--only-matched` (only the re-made tensors, for `merge_experts.py`). With `--gpu
+  --dump-device=cuda` the whole loop runs on the GPU (DeepSeek V4.1, 120 expert tensors: 77 min on an RTX 5090).
+  DeepSeek V4.1 at unsloth UD-IQ1_M's exact layout: KL 0.194 (plain rounding 0.404, UD-IQ1_M 0.198; 8 sequences).
+- gpuq: a device-pointer API (quantize / dequantize super-blocks on the caller's stream, ggml's `to_float` of the
+  i-quants on the GPU).
+- CUDA checked on an RTX 5090: the self-test is byte-identical for all 9 types and the 4 GPU-read sources.
+- `setup.sh --torch-gpu [--torch-index cu130|rocm7.2]`: the converter's torch version built for the GPU.
+- `tools/gguf_set_split_no.py`, `recipes/deepseek-v4.1-1017-ldlq/` (the 132G / 139G rules files).
+
 ## v0.2.1 - 2026-10-30
 
 - `tools/imatrix.py calib --size=micro|tiny|small|medium --scale=N`: a bigger calibration text from the same pinned
