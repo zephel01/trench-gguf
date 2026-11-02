@@ -8,3 +8,4 @@ third_party/
 trench.env
 setup-*.log
 tools/teacher
+tools/hessian_dump

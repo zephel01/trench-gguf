@@ -5,19 +5,21 @@
 #   3. the GPU: ROCm (hipcc + rocminfo) or CUDA (nvcc + nvidia-smi), and its architecture
 #   4. gpuq/gpuq_tables.bin + gpuq/libgpuq.so (ROCm) or gpuq/libgpuq_cuda.so (CUDA)   (build.sh)
 #   5. llama.cpp on the GPU (third_party/llama.cpp-gpu, the same commit + patches/llama-expert-upload.diff: libllama +
-#      llama-imatrix) and tools/teacher (quality check) built on it
+#      llama-imatrix) and tools/teacher (quality check) and tools/hessian_dump (LDLQ's Hessian material) built on it
 #   6. a Python venv (.venv) with numpy, pyarrow (tools/imatrix.py), huggingface_hub (the hf command), llama.cpp's gguf-py
-#      and its converter's packages (torch for the CPU, transformers, sentencepiece: tools/convert_hf.py)
+#      and its converter's packages (torch for the CPU, transformers, sentencepiece: tools/convert_hf.py);
+#      --torch-gpu: the same torch version built for your GPU instead (LDLQ's error-feedback loop on the GPU)
 #   7. the self-test: random weights quantized on the CPU (ggml) and on the GPU, byte for byte
 #   8. trench.env: `source trench.env` sets LIBGGML / GPUQ_LIB / LLAMA_DIR / LLAMA_BIN / TEACHER for tools/*
 #
 # usage: ./setup.sh [--llama <llama.cpp folder>] [--llama-build <its build folder with bin/libggml-base.so>]
 #                   [--llama-gpu-build <a ROCm/CUDA build folder with bin/llama-imatrix, to reuse>]
 #                   [--backend auto|hip|cuda] [--arch gfx1201,gfx1100 | sm_120] [--ref <git ref>] [--no-test]
+#                   [--torch-gpu [--torch-index cu130|rocm7.2|...]]
 set -euo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
-LLAMA="" LBUILD="" GBUILD="" BACKEND=auto ARCH="" REF="" TEST=1
+LLAMA="" LBUILD="" GBUILD="" BACKEND=auto ARCH="" REF="" TEST=1 TORCH_GPU=0 TORCH_INDEX=""
 while [ $# -gt 0 ]; do
   case $1 in
     --llama) LLAMA=$2; shift 2 ;;
@@ -27,7 +29,9 @@ while [ $# -gt 0 ]; do
     --arch) ARCH=$2; shift 2 ;;
     --ref) REF=$2; shift 2 ;;
     --no-test) TEST=0; shift ;;
-    -h|--help) sed -n 2,15p "$0"; exit 0 ;;
+    --torch-gpu) TORCH_GPU=1; shift ;;
+    --torch-index) TORCH_INDEX=$2; shift 2 ;;
+    -h|--help) sed -n 2,18p "$0"; exit 0 ;;
     *) echo "unknown option $1 (--help)"; exit 2 ;;
   esac
 done
@@ -127,7 +131,9 @@ fi
 [ -x "$GBUILD/bin/llama-imatrix" ] || fail "$GBUILD/bin/llama-imatrix not found" "pass --llama-gpu-build <a ROCm/CUDA build folder>"
 g++ -O2 -std=c++17 tools/teacher.cpp -I"$LLAMA/include" -I"$LLAMA/ggml/include" -L"$GBUILD/bin" -lllama -lggml -lggml-base \
     -Wl,-rpath,"$GBUILD/bin" -o tools/teacher 2>> "$ROOT/setup-cmake-gpu.log" || fail "building tools/teacher" "see setup-cmake-gpu.log"
-ok "$GBUILD/bin/llama-imatrix, tools/teacher"
+g++ -O2 -std=c++17 tools/hessian_dump.cpp -I"$LLAMA/include" -I"$LLAMA/ggml/include" -L"$GBUILD/bin" -lllama -lggml -lggml-base \
+    -Wl,-rpath,"$GBUILD/bin" -o tools/hessian_dump 2>> "$ROOT/setup-cmake-gpu.log" || fail "building tools/hessian_dump" "see setup-cmake-gpu.log"
+ok "$GBUILD/bin/llama-imatrix, tools/teacher, tools/hessian_dump"
 
 step 6/8 "Python (.venv)"
 if [ ! -x .venv/bin/python ]; then
@@ -136,6 +142,19 @@ fi
 .venv/bin/pip install --quiet --upgrade pip > "$ROOT/setup-pip.log" 2>&1
 .venv/bin/pip install --quiet -r "$LLAMA/requirements/requirements-convert_hf_to_gguf.txt" >> "$ROOT/setup-pip.log" 2>&1 \
   || fail "pip install (llama.cpp's converter packages: torch, transformers ...)" "see setup-pip.log"
+if [ $TORCH_GPU = 1 ]; then
+  # the torch version llama.cpp's converter pins, built for the GPU (pytorch.org's wheel index for CUDA 13.0 / ROCm 7.2)
+  TV=$(sed -n 's/^torch==\([0-9.]*\).*/\1/p' "$LLAMA/requirements/requirements-convert_hf_to_gguf.txt" | head -1)
+  [ -n "$TORCH_INDEX" ] || { [ "$BACKEND" = cuda ] && TORCH_INDEX=cu130 || TORCH_INDEX=rocm7.2; }
+  echo "  torch ${TV:-latest} for the GPU ($TORCH_INDEX, a few GB)"
+  .venv/bin/pip install --quiet "torch${TV:+==$TV+$TORCH_INDEX}" \
+      --index-url "https://download.pytorch.org/whl/$TORCH_INDEX" --extra-index-url https://pypi.org/simple \
+      >> "$ROOT/setup-pip.log" 2>&1 \
+    || fail "pip install torch ($TORCH_INDEX)" "see setup-pip.log; another index: --torch-index cu128 / rocm7.1"
+  .venv/bin/python -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)' \
+    || fail "torch does not see the GPU" "check nvidia-smi / rocminfo; another index: --torch-index ..."
+  ok "torch for the GPU: $(.venv/bin/python -c 'import torch; print(torch.__version__, torch.cuda.get_device_name(0))')"
+fi
 # (huggingface_hub comes with transformers, in the version it supports - upgrading it breaks the converter)
 .venv/bin/pip install --quiet pyarrow "$LLAMA/gguf-py" >> "$ROOT/setup-pip.log" 2>&1 \
   || fail "pip install pyarrow gguf-py" "see setup-pip.log"

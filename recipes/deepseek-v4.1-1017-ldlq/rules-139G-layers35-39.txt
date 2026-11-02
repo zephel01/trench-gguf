@@ -1,0 +1,16 @@
+# DeepSeek V4.1 Flash 1017 LDLQ 139G: layers 35-39 again at IQ3_XXS (LDLQ), merged over 132G. Published 139G/.
+^blk\.35\.ffn_gate_exps\.weight$ iq3_xxs
+^blk\.35\.ffn_up_exps\.weight$ iq3_xxs
+^blk\.35\.ffn_down_exps\.weight$ iq3_xxs
+^blk\.36\.ffn_gate_exps\.weight$ iq3_xxs
+^blk\.36\.ffn_up_exps\.weight$ iq3_xxs
+^blk\.36\.ffn_down_exps\.weight$ iq3_xxs
+^blk\.37\.ffn_gate_exps\.weight$ iq3_xxs
+^blk\.37\.ffn_up_exps\.weight$ iq3_xxs
+^blk\.37\.ffn_down_exps\.weight$ iq3_xxs
+^blk\.38\.ffn_gate_exps\.weight$ iq3_xxs
+^blk\.38\.ffn_up_exps\.weight$ iq3_xxs
+^blk\.38\.ffn_down_exps\.weight$ iq3_xxs
+^blk\.39\.ffn_gate_exps\.weight$ iq3_xxs
+^blk\.39\.ffn_up_exps\.weight$ iq3_xxs
+^blk\.39\.ffn_down_exps\.weight$ iq3_xxs
