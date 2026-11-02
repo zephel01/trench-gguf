@@ -3,7 +3,7 @@
 // chunks a batch as separate sequences).
 //
 //   hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] [--chunks=N]
-//                [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe]
+//                [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe] [--all-logits]
 //
 // For every MUL_MAT_ID whose weight is blk.L.ffn_gate_exps.weight it writes the op's input rows (the gate/up input of
 // layer L, one row a token, the same for all experts) and the routing ids:
@@ -34,12 +34,19 @@
 // rows are big: DeepSeek V4.1 ~100 KB a token a layer; 16 chunks = 32K tokens is 4x the widest input).
 // --no-moe skips the expert inputs (a dense-only pass).
 //
+// llama.cpp drops the rows nobody reads the output of before the last layer's FFN (OLMoE, Qwen MoE ...), so with no
+// logits asked for, that layer sees no tokens. After the first batch the dump checks that every layer got the same
+// rows; if the last ones did not, it starts again with a logit asked for every token (--all-logits from the start:
+// the output buffer then holds n_vocab floats a token of the batch, e.g. 50K x 8192 x 4 = 1.6 GB).
+//
 // --gpu: dense tensors on the GPU, experts on the host (as tools/imatrix.py run --gpu / teacher --gpu); the inputs
 // are read back from wherever the op ran. Needs a ROCm/CUDA llama.cpp build (the patched one of setup.sh for models
 // bigger than RAM); without --gpu a CPU build is enough.
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "llama.h"
+#include <algorithm>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -265,7 +272,7 @@ int main(int argc, char ** argv) {
     std::vector<const char *> args;
     int nt = 16, n_ctx = 2048, ub = 8192, max_chunks = 0, dense_chunks = 0;
     std::string dense_re;
-    bool gpu = false;
+    bool gpu = false, all_logits = false;
     Dump d;
     for (int i = 1; i < argc; ++i) {
         if (!strncmp(argv[i], "--threads=", 10)) nt = atoi(argv[i] + 10);
@@ -279,11 +286,12 @@ int main(int argc, char ** argv) {
         else if (!strncmp(argv[i], "--dense-chunks=", 15)) dense_chunks = atoi(argv[i] + 15);
         else if (!strcmp(argv[i], "--no-moe")) d.moe = false;
         else if (!strcmp(argv[i], "--gpu")) gpu = true;
+        else if (!strcmp(argv[i], "--all-logits")) all_logits = true;
         else args.push_back(argv[i]);
     }
     if (args.size() != 3) {
         fprintf(stderr, "usage: hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] "
-                        "[--chunks=N] [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe]\n");
+                        "[--chunks=N] [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe] [--all-logits]\n");
         return 2;
     }
     d.dir = args[2];
@@ -335,13 +343,36 @@ int main(int argc, char ** argv) {
         for (int s = 0; s < ns; ++s)
             for (int k = 0; k < n_ctx; ++k) {
                 const int i = b.n_tokens++;
-                b.token[i] = tokens[(size_t) (c0 + s) * n_ctx + k]; b.pos[i] = k; b.n_seq_id[i] = 1; b.seq_id[i][0] = s; b.logits[i] = 0;
+                b.token[i] = tokens[(size_t) (c0 + s) * n_ctx + k]; b.pos[i] = k; b.n_seq_id[i] = 1; b.seq_id[i][0] = s; b.logits[i] = all_logits;
             }
         if (llama_decode(ctx, b)) { fprintf(stderr, "decode failed at chunk %d\n", c0); fflush(stderr); return 1; }
+        if (c0 == 0 && d.moe && !all_logits && !d.rows.empty()) {
+            int64_t mx = (int64_t) ns * n_ctx, mn = INT64_MAX;   // (every token of the batch, in every layer)
+            for (auto & kv : d.rows) mn = std::min(mn, kv.second);
+            if (mn < mx) {   // (the last layer pruned to the output rows: start again with every row an output)
+                printf("a layer got %lld rows of %lld (llama.cpp skips rows without an output in the last layer): "
+                       "again with a logit for every token\n", (long long) mn, (long long) mx);
+                fflush(stdout);
+                for (auto & kv : d.files) fclose(kv.second);
+                d.files.clear(); d.rows.clear(); d.dense_files.clear(); d.dense_weight.clear();
+                all_logits = true;
+                c0 -= n_seq;   // (the loop adds it back: this batch again)
+                continue;
+            }
+        }
         printf("chunks %d-%d of %d done\n", c0, c0 + ns - 1, n_chunk);
         fflush(stdout);
     }
     for (auto & kv : d.files) fclose(kv.second);
+    if (d.moe && !d.rows.empty()) {   // (no info.txt when a layer is short: requant_experts.py then refuses the dump)
+        int64_t mx = 0;
+        for (auto & kv : d.rows) mx = std::max(mx, kv.second);
+        for (auto & kv : d.rows)
+            if (kv.second != mx) {
+                fprintf(stderr, "layer %d got %lld rows of %lld: the dump is not usable\n", kv.first, (long long) kv.second, (long long) mx);
+                return 1;
+            }
+    }
     FILE * f = fopen((d.dir + "/info.txt").c_str(), "w");
     int64_t rows = d.rows.empty() ? 0 : d.rows.begin()->second;
     fprintf(f, "model %s\ntext %s\nctx %d\nchunks %d\ntokens %lld\nn_embd %d\nn_ff %d\nn_expert_used %d\nlayers", args[0], args[1],
