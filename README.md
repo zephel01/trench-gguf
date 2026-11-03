@@ -269,6 +269,10 @@ use `--ub=8192`.
   --gpu --threads=16 --ctx=2048 --ub=16384 --chunks=240
 ```
 
+For a thinking model, put chat transcripts in the model's own template at the start of the calibration file and add
+`--parse-special` (`<|im_start|>`, `<think>` ... become those tokens). A plain-text calibration left our Qwen3.8 build
+ending turns right after `</think>` with no answer; the chat transcripts fixed it at the same KL.
+
 **Step 5 — LDLQ** (77 min and 9 min). The rules files come with trench-gguf: 132G is UD-IQ1_M's expert layout,
 139G re-makes layers 35-39 at IQ3_XXS. `--only-matched` writes only the new expert tensors.
 
@@ -446,7 +450,8 @@ python tools/merge_experts.py <base shard 1> <donor shard 1> <out folder> <out n
 ```
 
 The listed layers' `ffn_{gate,up,down}_exps` come from the donor, everything else from the base, nothing is
-re-quantized. Shards without a swapped tensor are copied as they are.
+re-quantized. Shards without a swapped tensor are copied as they are. A layer item may name the tensors to take:
+`5-19:down,30:gate+up` (default: all three).
 
 ### Prune experts / re-quantize a big table
 

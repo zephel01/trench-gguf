@@ -4,6 +4,10 @@
 //
 //   hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] [--chunks=N]
 //                [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe] [--all-logits]
+//                [--parse-special]
+//
+// --parse-special reads special-token text in the calibration file (<|im_start|>, <think>, ...) as those tokens, for
+// a calibration of chat transcripts written in the model's own template.
 //
 // For every MUL_MAT_ID whose weight is blk.L.ffn_gate_exps.weight it writes the op's input rows (the gate/up input of
 // layer L, one row a token, the same for all experts) and the routing ids:
@@ -272,7 +276,7 @@ int main(int argc, char ** argv) {
     std::vector<const char *> args;
     int nt = 16, n_ctx = 2048, ub = 8192, max_chunks = 0, dense_chunks = 0;
     std::string dense_re;
-    bool gpu = false, all_logits = false;
+    bool gpu = false, all_logits = false, parse_special = false;
     Dump d;
     for (int i = 1; i < argc; ++i) {
         if (!strncmp(argv[i], "--threads=", 10)) nt = atoi(argv[i] + 10);
@@ -287,11 +291,13 @@ int main(int argc, char ** argv) {
         else if (!strcmp(argv[i], "--no-moe")) d.moe = false;
         else if (!strcmp(argv[i], "--gpu")) gpu = true;
         else if (!strcmp(argv[i], "--all-logits")) all_logits = true;
+        else if (!strcmp(argv[i], "--parse-special")) parse_special = true;
         else args.push_back(argv[i]);
     }
     if (args.size() != 3) {
         fprintf(stderr, "usage: hessian_dump <model.gguf> <calib.txt> <out dir> [--gpu] [--threads=N] [--ctx=2048] [--ub=8192] "
-                        "[--chunks=N] [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe] [--all-logits]\n");
+                        "[--chunks=N] [--dump-down] [--layers=a-b] [--dense[=<regex>]] [--dense-chunks=N] [--no-moe] [--all-logits] "
+                        "[--parse-special]\n");
         return 2;
     }
     d.dir = args[2];
@@ -315,8 +321,8 @@ int main(int argc, char ** argv) {
     std::ifstream in(args[1]);
     std::string text((std::istreambuf_iterator<char>(in)), {});
     std::vector<llama_token> tokens(text.size() + 16);
-    int n = llama_tokenize(vocab, text.c_str(), (int) text.size(), tokens.data(), (int) tokens.size(), true, false);
-    if (n < 0) { tokens.resize(-n); n = llama_tokenize(vocab, text.c_str(), (int) text.size(), tokens.data(), (int) tokens.size(), true, false); }
+    int n = llama_tokenize(vocab, text.c_str(), (int) text.size(), tokens.data(), (int) tokens.size(), true, parse_special);
+    if (n < 0) { tokens.resize(-n); n = llama_tokenize(vocab, text.c_str(), (int) text.size(), tokens.data(), (int) tokens.size(), true, parse_special); }
     tokens.resize(n);
     int n_chunk = n / n_ctx;
     if (max_chunks > 0 && n_chunk > max_chunks) n_chunk = max_chunks;
@@ -349,6 +355,10 @@ int main(int argc, char ** argv) {
         if (c0 == 0 && d.moe && !all_logits && !d.rows.empty()) {
             int64_t mx = (int64_t) ns * n_ctx, mn = INT64_MAX;   // (every token of the batch, in every layer)
             for (auto & kv : d.rows) mn = std::min(mn, kv.second);
+            // (a last layer pruned to no rows at all never reaches the callback and is missing from d.rows: Qwen3.8's
+            // layer 47 with --chunks of whole batches; the last layer of these models is always a MoE layer)
+            const int last = std::min(d.hi, llama_model_n_layer(model) - 1);
+            if (d.rows.rbegin()->first < last) mn = 0;
             if (mn < mx) {   // (the last layer pruned to the output rows: start again with every row an output)
                 printf("a layer got %lld rows of %lld (llama.cpp skips rows without an output in the last layer): "
                        "again with a logit for every token\n", (long long) mn, (long long) mx);

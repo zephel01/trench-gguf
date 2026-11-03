@@ -3,6 +3,7 @@ files with the listed layers' ffn_{gate,up,down}_exps taken byte for byte from t
 the result is exactly the mix that a native_experts.txt row swap measured.
 
 usage: merge_experts.py <base shard 1> <donor shard 1> <out dir> <out stem> <layers, e.g. 0,1,2,5-9> [--check]
+  A layer item may name the tensors to take: 5-19:down, 30:gate+up (default: gate, up and down).
   Each base shard becomes <out stem>-NNNNN-of-MMMMM.gguf (the base's split); a shard with no swapped tensor is hard-linked
   (a copy on another disk). Donor shards that are not there are skipped (V4.1: the Engram-only shard). GGUF_PY as in requant_experts.py.
 """
@@ -36,13 +37,18 @@ def link_or_copy(src, dst):
 
 
 def parse_layers(s):
-    out = set()
+    """{layer: roles taken from the donor}: '0-4,5-19:down,30:gate+up'."""
+    out = {}
     for part in s.split(","):
-        if "-" in part:
-            a, b = part.split("-")
-            out.update(range(int(a), int(b) + 1))
-        elif part:
-            out.add(int(part))
+        if not part:
+            continue
+        rng, _, roles = part.partition(":")
+        roles = set(roles.split("+")) if roles else {"gate", "up", "down"}
+        if roles - {"gate", "up", "down"}:
+            raise SystemExit("unknown tensor in %r (gate, up, down)" % part)
+        a, _, b = rng.partition("-")
+        for l in range(int(a), int(b or a) + 1):
+            out.setdefault(l, set()).update(roles)
     return out
 
 
@@ -67,9 +73,9 @@ def main():
             continue
         for t in r.tensors:
             m = pat.match(t.name)
-            if m and int(m.group(1)) in take:
+            if m and m.group(2) in take.get(int(m.group(1)), ()):
                 donor[t.name] = t
-    want = {"blk.%d.ffn_%s_exps.weight" % (l, p) for l in take for p in ("gate", "up", "down")}
+    want = {"blk.%d.ffn_%s_exps.weight" % (l, p) for l, roles in take.items() for p in roles}
     if want - set(donor):
         print("the donor lacks: %s" % ", ".join(sorted(want - set(donor))[:6]))
         return 1
