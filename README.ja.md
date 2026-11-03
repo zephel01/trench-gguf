@@ -67,6 +67,10 @@ DeepSeek V4.1 のエキスパート全部を、AI PRO R9700 で 15 分半で量�
 - **2 つの GGUF を層ごとに組み合わせる（`tools/merge_experts.py`）**
   - 層ごとに、どちらかの GGUF のエキスパートをバイト単位でそのまま使います。
   - 公開するファイルが、測った組み合わせとまったく同じになります。
+- **測ったとおりにエキスパートを削る（`tools/prune_experts.py`、`tools/requant_table.py`）**
+  - 層ごとに、指定したエキスパートだけを残します。エキスパート・ルーターの行・bias をバイト単位で切り出し、量子化し直しはしません。
+  - DeepSeek V4.1 の Engram 表のような大きな表を、GPU で量子化し直せます（unsloth の FP8「型 43」の表も読めます）。
+  - 公開している [DeepSeek V4.1 Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF) はこれで作りました。
 - **セットアップは 1 本**
   - `./setup.sh` だけで準備が終わります。
   - llama.cpp の取得、`libggml-base` と直しを当てた GPU 版（llama-imatrix、品質チェック用）のビルド、GPU の判別、ライブラリのビルド、ggml との一致の自己テストまで行います。初回は 20〜40 分かかります。
@@ -476,6 +480,18 @@ python tools/merge_experts.py <土台のシャード 1> <差し替え元のシ�
 - 指定した層の `ffn_{gate,up,down}_exps` を差し替え元から取り、それ以外はすべて土台から取ります。
 - 量子化し直しはしません。
 - 差し替えるテンソルがないシャードは、そのままコピーします。
+
+### エキスパートを削る / 大きな表を量子化し直す
+
+```bash
+python tools/prune_experts.py <シャード 1> keep.json <出力フォルダ> <出力名> [--no-copy]
+python tools/requant_table.py <元のシャード> per_layer_token_embd.weight IQ4_NL <置き換えるシャード> <出力.gguf>
+```
+
+- `keep.json` は `{"<層>": [エキスパートの番号], ...}` の形で、MoE の層ごとに同じ個数を書きます。
+- どれを残すかは自分で決めます。残したい言語と用途すべての文章で「どのエキスパートが選ばれるか」を数えて選ぶのがおすすめです（コードだけで選ぶと、手元のテストでは日本語が崩れました）。
+- ハッシュでルーティングする層があるモデルは、削れません。
+- `requant_table.py` は表を少しずつ GPU で量子化し、置き換えるシャードの `split.*` をそのまま引き継いだシャードを書きます。一部を取り出して測った誤差（相対 RMS）も表示します。
 
 ### 一致を自分で確かめる
 

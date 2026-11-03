@@ -57,6 +57,10 @@ the search, no change in quality. A whole DeepSeek V4.1 expert set took 15.5 min
   into a rules file, optionally a step smaller or larger, so you can re-make that layout from the original.
 - **Mix two GGUFs per layer** — `tools/merge_experts.py` builds a GGUF set whose expert layers come from one of two
   sets, byte for byte, so the file you publish is exactly the mix you measured.
+- **Prune experts, keep what you measured** — `tools/prune_experts.py` keeps only the listed routed experts per layer
+  (experts, router rows and biases sliced byte for byte, nothing re-quantized); `tools/requant_table.py` re-quantizes a
+  big table such as DeepSeek V4.1's Engram on the GPU (it reads unsloth's FP8 type-43 table). Used for the published
+  [DeepSeek V4.1 Compact JA256](https://huggingface.co/zephel01/DeepSeek-V4.1-Flash-1017-Compact-32G96G-GGUF).
 - **One setup script** — `./setup.sh` fetches llama.cpp, builds `libggml-base` and a patched GPU build (llama-imatrix,
   the quality check), finds your GPU, builds the
   library and runs a self-test against ggml.
@@ -443,6 +447,19 @@ python tools/merge_experts.py <base shard 1> <donor shard 1> <out folder> <out n
 
 The listed layers' `ffn_{gate,up,down}_exps` come from the donor, everything else from the base, nothing is
 re-quantized. Shards without a swapped tensor are copied as they are.
+
+### Prune experts / re-quantize a big table
+
+```bash
+python tools/prune_experts.py <shard 1> keep.json <out folder> <out name> [--no-copy]
+python tools/requant_table.py <src shard> per_layer_token_embd.weight IQ4_NL <template shard> <out.gguf>
+```
+
+- `keep.json` is `{"<layer>": [expert ids], ...}`, the same count in every MoE layer. Which experts to keep is your
+  choice: pick them from routing counts on text of every language and task the model should keep (a selection on code
+  only dropped Japanese in our tests). Models with hash-routed layers are refused.
+- `requant_table.py` streams the table through the GPU quantizer and writes a shard that replaces the template shard
+  of the set (its `split.*` keys are kept). It prints the relative RMS error of a sample.
 
 ### Check the match yourself
 
