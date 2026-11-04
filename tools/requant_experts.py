@@ -179,6 +179,15 @@ class Shards:
             self.readers[p] = r
             for t in r.tensors:
                 self.where[t.name] = (p, t)
+        # NVFP4 experts carry a per-expert second scale (blk.L.ffn_*_exps.scale, F32 [n_expert]) that the matmul
+        # applies after the block-scaled product (llama.cpp build_lora_mm_id's w_s): the expert's real weights are
+        # to_float(bytes) x scale[e].  (.input_scale is the activations' and stays out of the weights.)
+        self.escale = {}
+        for name, (p, t) in self.where.items():
+            if name.endswith("_exps.scale") and len(t.shape) == 1:
+                w = name[:-len(".scale")] + ".weight"
+                if w in self.where:
+                    self.escale[w] = np.asarray(t.data, dtype=np.float32).reshape(-1).copy()
         self.lib = lib or ctypes.CDLL(LIBGGML)
         self.lib.ggml_get_type_traits.restype = ctypes.POINTER(TypeTraits)
         self.lib.ggml_get_type_traits.argtypes = [ctypes.c_int]
@@ -197,6 +206,8 @@ class Shards:
         raw = np.ascontiguousarray(np.asarray(t.data).reshape(ne2, -1)[e])
         f32 = np.empty(ne1 * ne0, dtype=np.float32)
         self.to_float[src](raw.ctypes.data, f32.ctypes.data, ne1 * ne0)
+        if name in self.escale:
+            f32 *= self.escale[name][e]
         return f32.reshape(ne1, ne0)
 
 
@@ -275,6 +286,10 @@ def main() -> int:
     lib = ctypes.CDLL(LIBGGML)
     if dump_dir:
         src_shards = Shards(shard1, lib)
+    escale = (src_shards or Shards(shard1, lib)).escale   # (NVFP4's per-expert scales, folded into every dequant)
+    if escale:
+        print("source: %d expert tensors with a per-expert scale (NVFP4): folded into the weights; their .scale / "
+              ".input_scale tensors are left out of re-quantized output" % len(escale), flush=True)
     lib.ggml_quantize_chunk.restype = ctypes.c_size_t
     lib.ggml_quantize_chunk.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int64,
                                         ctypes.c_int64, ctypes.c_void_p]
@@ -395,6 +410,11 @@ def main() -> int:
                                                                new_type.name, nbytes / 2**30))
         if check:
             continue
+        if escale:
+            redone = {t.name for t, nt, _ in plan if nt is not None}
+            plan = [p_ for p_ in plan if not (p_[1] is None and (
+                (p_[0].name.endswith("_exps.scale") and p_[0].name[:-6] + ".weight" in redone) or
+                (p_[0].name.endswith("_exps.input_scale") and p_[0].name[:-12] + ".weight" in redone)))]
         if only_matched:
             plan_w = [p for p in plan if p[1] is not None]
             if not plan_w:
@@ -446,7 +466,8 @@ def main() -> int:
             im = None if t.name in no_im else imat.get(t.name)   # (None: quantized without one, as llama-quantize does)
 
             on_gpu = gq is not None and im is not None and gq.gpuq_block_bytes(int(new_type)) > 0
-            gpu_dq = on_gpu and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
+            esc = escale.get(t.name)   # (NVFP4: expert e's weights x esc[e])
+            gpu_dq = on_gpu and esc is None and gq.gpuq_can_dequantize(int(src)) == 1   # (read the source bytes on the GPU too)
 
             # error-feedback rounding: a Hessian provider per tensor, from files (--hessian) or from a dump (--dump)
             hess = None
@@ -570,11 +591,13 @@ def main() -> int:
                             tt = src_shards.tensor(name)
                             n0, n1 = int(tt.shape[0]), int(tt.shape[1])
                             rb, st = np.asarray(tt.data).reshape(int(tt.shape[2]), -1)[e], tt.tensor_type
-                        f = gqt.dequant_src(st, rb, n1 * n0, dev)
+                        f = gqt.dequant_src(st, rb, n1 * n0, dev) if name not in escale else None
                         if f is None:
                             if name == t.name:
                                 h = np.empty(n1 * n0, dtype=np.float32)
                                 to_float[src](rb.ctypes.data, h.ctypes.data, h.size)
+                                if esc is not None:
+                                    h *= esc[e]
                             else:
                                 h = src_shards.dequant_expert(name, e)
                             f = torch.from_numpy(h).to(dev)
@@ -630,6 +653,8 @@ def main() -> int:
                         return per
                     f32 = np.empty(ne1 * ne0, dtype=np.float32)
                     to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
+                    if esc is not None:
+                        f32 *= esc[e]
                     W = f32.reshape(ne1, ne0)
                     if share_key is not None and e in hess_cache:
                         U, perm, diag_n, dead = hess_cache[e]
@@ -662,6 +687,8 @@ def main() -> int:
                                                   ne0, im[e].ctypes.data)
                 f32 = np.empty(ne1 * ne0, dtype=np.float32)
                 to_float[src](raw[e].ctypes.data, f32.ctypes.data, ne1 * ne0)
+                if esc is not None:
+                    f32 *= esc[e]
                 if on_gpu:
                     with gq_lock:
                         return gq.gpuq_quantize(int(new_type), f32.ctypes.data, dst[e].ctypes.data, ne1, ne0,

@@ -3,6 +3,23 @@
 Every release is on GitHub (Releases) with these notes. Update: `git pull`, then `./setup.sh` (it rebuilds only what
 changed).
 
+## v0.3.1 - 2026-11-04
+
+The tools behind [zephel01/Qwen3.8-Flash-Next-12G32G-GGUF](https://huggingface.co/zephel01/Qwen3.8-Flash-Next-12G32G-GGUF)
+and the DeepSeek V4.1 Compact JA256 GGUF.
+
+- `tools/requant_experts.py` reads NVFP4 sources: the per-expert `.scale` is folded into the weights; the `.scale` /
+  `.input_scale` tensors of re-made experts are left out of the output.
+- `tools/hessian_dump --parse-special`: special-token text in the calibration file becomes those tokens, for a
+  calibration that starts with the model's own chat transcripts. A plain-text calibration left a Qwen3.8 build ending
+  turns right after `</think>` with no answer (and thinking 3,000+ tokens on short questions); chat transcripts fixed
+  both at about the same KL (0.327 -> 0.339).
+- `hessian_dump`: a last MoE layer pruned to no rows (Qwen3.8 layer 47) counts as short and triggers the
+  `--all-logits` pass.
+- `tools/merge_experts.py`: a layer item may name the tensors to take (`5-19:down,30:gate+up`).
+- `tools/prune_experts.py` (keep the listed experts, byte for byte) and `tools/requant_table.py` (re-quantize a big
+  table on the GPU; reads unsloth's FP8 type 43, an MXFP8 row layout).
+
 ## v0.3.0 - 2026-11-03
 
 **LDLQ: better rounding at the same types and bytes, on the GPU.** The tools behind

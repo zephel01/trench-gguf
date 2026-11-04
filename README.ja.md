@@ -393,6 +393,7 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
 - **元のファイルはなるべく精度の高いものを**
   - 元のファイルの丸め誤差に、新しい量子化の誤差が重なります。
   - たとえば DeepSeek V4.1 なら、unsloth の UD-Q4_K_XL のエキスパートは配布元の MXFP4 そのままです。量子化し直す前に失われるものがありません。
+  - NVFP4 の GGUF（たとえば magnitudedev の Qwen3.8-Flash-Next NVFP4）も元にできます。エキスパートごとの `.scale` を重みに掛けて読み、量子化し直したエキスパートの `.scale` / `.input_scale` は出力に入れません。
 - **`--gpu`**
   - IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL を GPU で計算します。2 枚目の GPU を使うときは `--gpu=1` です。
   - それ以外の型（k-quant）は CPU で計算します。

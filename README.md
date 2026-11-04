@@ -360,6 +360,8 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
 
 - Start from the most precise file you have: the source's rounding error adds to the new one. unsloth's UD-Q4_K_XL
   of DeepSeek V4.1 keeps the experts as the released MXFP4, so nothing is lost before the re-quantization.
+- An NVFP4 source (e.g. magnitudedev's Qwen3.8-Flash-Next NVFP4 GGUF) works too: its per-expert `.scale` is folded
+  into the weights, and the `.scale` / `.input_scale` tensors of re-made experts are left out of the output.
 - `--gpu` runs IQ1_S / IQ1_M / IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS / IQ4_NL on the GPU (`--gpu=1`
   for GPU 1); other types (k-quants) stay on the CPU. Lines ending in `(gpu)` ran entirely on the GPU; `(gpu quant,
   cpu dequant)` means the source type (a k-quant or an i-quant) was dequantized on the CPU first.
