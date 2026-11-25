@@ -27,6 +27,8 @@
 #define hipGetLastError cudaGetLastError
 #define hipDeviceSynchronize cudaDeviceSynchronize
 #define hipStream_t cudaStream_t
+#define hipHostMalloc(p, n, f) cudaMallocHost(p, n)
+#define hipHostFree cudaFreeHost
 #else
 #include <hip/hip_runtime.h>
 #endif
@@ -2142,6 +2144,16 @@ __global__ void kdq(int src, const uint8_t * in, float * out, int64_t n) {   // 
 
 namespace {
 uint8_t * g_raw = nullptr; size_t g_raw_cap = 0;
+uint8_t * g_hy = nullptr; size_t g_hy_cap = 0;   // pinned host staging for the results (no pageable D2H copies)
+
+bool grow_pinned(uint8_t ** p, size_t * cap, size_t need) {
+    if (need <= *cap) return true;
+    if (*p) (void) hipHostFree(*p);
+    *p = nullptr; *cap = 0;
+    if (hipHostMalloc((void **) p, need, 0) != hipSuccess) { *p = nullptr; return false; }
+    *cap = need;
+    return true;
+}
 
 size_t raw_bytes(int src, int64_t n) {
     switch (src) {
@@ -2198,7 +2210,9 @@ size_t quantize_gx(int type, void * dst, int64_t nmat, int64_t nrow, int64_t n_p
     }
 #undef KQ
     if (hipGetLastError() != hipSuccess || hipDeviceSynchronize() != hipSuccess) return 0;
-    if (hipMemcpy(dst, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+    if (!grow_pinned(&g_hy, &g_hy_cap, nblocks * bb)) return 0;
+    if (hipMemcpy(g_hy, g_y, nblocks * bb, hipMemcpyDeviceToHost) != hipSuccess) return 0;
+    memcpy(dst, g_hy, nblocks * bb);
     return nblocks * bb;
 }
 
@@ -2326,3 +2340,10 @@ extern "C" size_t gpuq_dequantize_src_dev(int src, const void * d_raw, float * d
     kdq<<<(unsigned) ((n/32 + th - 1) / th), th, 0, (hipStream_t) stream>>>(src, (const uint8_t *) d_raw, d_out, n);
     return hipGetLastError() == hipSuccess ? (size_t) n * 4 : 0;
 }
+
+// pinned host memory for the caller's source batches (DMA straight from it; never the file's own mapped pages)
+extern "C" void * gpuq_host_alloc(size_t n) {
+    void * p = nullptr;
+    return hipHostMalloc(&p, n, 0) == hipSuccess ? p : nullptr;
+}
+extern "C" void gpuq_host_free(void * p) { if (p) (void) hipHostFree(p); }

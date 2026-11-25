@@ -147,6 +147,11 @@ def load_gpuq(device=0, quiet=False):
             gq.gpuq_requantize_batch.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
                                                  ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_void_p]
             gq.gpuq_can_quantize.argtypes = [ctypes.c_int, ctypes.c_int]
+        gq.pinned = hasattr(gq, "gpuq_host_alloc")   # (a library with pinned buffers: parallel reads into them)
+        if gq.pinned:
+            gq.gpuq_host_alloc.restype = ctypes.c_void_p
+            gq.gpuq_host_alloc.argtypes = [ctypes.c_size_t]
+            gq.gpuq_host_free.argtypes = [ctypes.c_void_p]
         rc = gq.gpuq_init(os.path.join(here, "gpuq_tables.bin").encode(), int(device))
         if rc != 0:
             why.append("%s: gpuq_init %d (no GPU %d, or gpuq_tables.bin missing)" % (nm, rc, int(device)))
@@ -302,6 +307,7 @@ def main() -> int:
     gpu = next((a for a in flags if a == "--gpu" or a.startswith("--gpu=")), None)
     force_cpu = "--cpu" in flags
     gpu_batch_mb = int(os.environ.get("GPUQ_BATCH_MB", "2048"))
+    pin_cache = {}   # (the two pinned source buffers, the source fd and the read pool, reused)
     hess_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--hessian=")), None)
     hess_opt = {"damp": float(next((a.split("=", 1)[1] for a in flags if a.startswith("--damp=")), 0.01)),
                 "damp_iq1": next((float(a.split("=", 1)[1]) for a in flags if a.startswith("--damp-iq1=")), None),
@@ -776,8 +782,54 @@ def main() -> int:
                 dst_u = dst.reshape(nunit, -1)
                 per_u = dst_u.shape[1]
 
+                # read each batch with READ_THREADS parallel pread()s into one of two pinned buffers the
+                # GPU copies from (the original handed the file's mmap pages to hipMemcpy: one thread faulting them
+                # in, and the driver pinning page-cache pages, which stalled on ROCm under memory pressure)
+                fast = gpu_dq and getattr(gq, "pinned", False)
+                if fast:
+                    unit_b = src_u.shape[1] * src_u.itemsize
+                    file_off = src_u.ctypes.data - r.data.ctypes.data   # (where the tensor starts in the file)
+                    nbuf = k * unit_b
+                    if pin_cache.get("n", 0) < nbuf:
+                        for p_ in pin_cache.get("bufs", []):
+                            gq.gpuq_host_free(p_)
+                        pin_cache["bufs"] = [gq.gpuq_host_alloc(nbuf), gq.gpuq_host_alloc(nbuf)]
+                        pin_cache["n"] = nbuf
+                        assert all(pin_cache["bufs"]), "pinned host allocation failed"
+                    if "fd" not in pin_cache or pin_cache["path"] != sh:
+                        if "fd" in pin_cache:
+                            os.close(pin_cache["fd"])
+                        pin_cache["fd"], pin_cache["path"] = os.open(sh, os.O_RDONLY), sh
+                    fd = pin_cache["fd"]
+                    nth = int(os.environ.get("READ_THREADS", "8"))
+                    rpool = pin_cache.setdefault("pool", concurrent.futures.ThreadPoolExecutor(nth))
+                    turn = [0]
+
+                def load_fast(u0):
+                    u1 = min(nunit, u0 + k)
+                    nb_ = (u1 - u0) * unit_b
+                    base = pin_cache["bufs"][turn[0] & 1]
+                    turn[0] += 1
+                    mv = (ctypes.c_uint8 * nb_).from_address(base)
+                    off0 = file_off + u0 * unit_b
+                    chunk = 64 << 20
+
+                    def rd(a):
+                        b = min(nb_, a + chunk)
+                        view = memoryview(mv)[a:b]
+                        got = 0
+                        while got < b - a:
+                            n_ = os.preadv(fd, [view[got:]], off0 + a + got)
+                            if n_ <= 0:
+                                raise IOError("short read at %d" % (off0 + a + got))
+                            got += n_
+                    list(rpool.map(rd, range(0, nb_, chunk)))
+                    return base
+
                 def load(u0):
                     u1 = min(nunit, u0 + k)
+                    if fast:
+                        return load_fast(u0)
                     if gpu_dq:
                         return np.ascontiguousarray(src_u[u0:u1])   # (the copy pages the source in)
                     f32 = np.empty((u1 - u0, unit_f), dtype=np.float32)
@@ -804,7 +856,7 @@ def main() -> int:
                         w_ = None if imb is None else imb[0 if rows2d else u0].ctypes.data
                         with gq_lock:
                             if gpu_dq:
-                                got = gq.gpuq_requantize_batch(int(src), buf.ctypes.data, int(new_type),
+                                got = gq.gpuq_requantize_batch(int(src), buf if fast else buf.ctypes.data, int(new_type),
                                                                dst_u[u0].ctypes.data, nm, nr, ne0, w_)
                             else:
                                 got = gq.gpuq_quantize_batch(int(new_type), buf.ctypes.data, dst_u[u0].ctypes.data, nm,

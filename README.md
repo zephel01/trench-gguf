@@ -371,7 +371,8 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
   tensor, the k-quants, Q8_0, IQ4_NL and IQ4_XS take ggml's no-imatrix path on the GPU; IQ3_XXS / IQ3_S without one
   run on the CPU. Lines ending in `(gpu)` ran entirely on the GPU; `(gpu quant, cpu dequant)` means the source type
   (a k-quant or an i-quant) was dequantized on the CPU first. `GPUQ_BATCH_MB` (default 2048) is how many MB of
-  floats go to the GPU a call.
+  floats go to the GPU a call. Each batch is read with `READ_THREADS` (default 8) parallel reads into a pinned buffer
+  while the GPU works on the one before.
 - `--check` prints the plan and the sizes without writing.
 
 ### Convert a Hugging Face model (no GGUF published yet)
@@ -530,7 +531,8 @@ The start-up is reading the 0.8 GB imatrix and opening the source.
   through ggml. Sources dequantized on the GPU: F32, F16, BF16, Q8_0, MXFP4.
 - **Models**: MoE experts only; see [Supported models](#-supported-models) for rows that fall back and why.
 - **CUDA**: checked on an RTX 5090 (sm_120, CUDA 13): all 15 types and the GPU-read sources byte-identical, the LDLQ
-  loop's test passes. On ROCm the k-quants and Q8_0 passed the self-test (random weights) on a Radeon 8060S iGPU (gfx1151).
+  loop's test passes. The self-test also passes on an A100 (sm_80, CUDA 12.6). On ROCm the k-quants and Q8_0 passed
+  the self-test (random weights) on a Radeon 8060S iGPU (gfx1151).
 - **LDLQ**: the GPU loop needs torch for your GPU (`./setup.sh --torch-gpu`); without it, `--dump-device=cpu` runs
   the same loop on the CPU, much slower. Experts with fewer than 64 calibration rows fall back to plain rounding.
 - **Platforms**: checked on x86-64 Linux only. On ARM, gcc fuses FMA by default, so ggml's own CPU output changes;
