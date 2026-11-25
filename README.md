@@ -373,6 +373,11 @@ blk\.\d+\.ffn_down_exps\.weight                     iq2_s
   (a k-quant or an i-quant) was dequantized on the CPU first. `GPUQ_BATCH_MB` (default 2048) is how many MB of
   floats go to the GPU a call.
 - `--check` prints the plan and the sizes without writing.
+- `--ftype=<type>` (the type you would give llama-quantize, e.g. `--ftype=Q8_0`) writes the same file llama-quantize
+  does, byte for byte: its `general.file_type`, the `quantize.imatrix.*` keys, its tensor order and shapes. One md5
+  then checks a GPU-made file. Take the rules from a llama-quantize file made from the same source
+  (`rules_from_gguf.py --all`): llama-quantize leaves some tensors as they are (e.g. BF16). `--header-only` writes
+  only the header, to compare it with a llama-quantize file without quantizing.
 
 ### Convert a Hugging Face model (no GGUF published yet)
 

@@ -293,6 +293,29 @@ def read_imatrix(path):
     return out
 
 
+LLAMA_FTYPE = {"F32": 0, "F16": 1, "Q4_0": 2, "Q4_1": 3, "Q8_0": 7, "Q5_0": 8, "Q5_1": 9, "Q2_K": 10, "Q3_K_S": 11,
+               "Q3_K_M": 12, "Q3_K_L": 13, "Q4_K_S": 14, "Q4_K_M": 15, "Q5_K_S": 16, "Q5_K_M": 17, "Q6_K": 18,
+               "IQ2_XXS": 19, "IQ2_XS": 20, "Q2_K_S": 21, "IQ3_XS": 22, "IQ3_XXS": 23, "IQ1_S": 24, "IQ4_NL": 25,
+               "IQ3_S": 26, "IQ3_M": 27, "IQ2_S": 28, "IQ2_M": 29, "IQ4_XS": 30, "IQ1_M": 31, "BF16": 32,
+               "MXFP4_MOE": 38}   # (llama.h's llama_ftype)
+GGML_QNT_VERSION = 2
+
+
+def llama_order(name):
+    """llama_model_loader's weight_name_comparer: block number first (-1 outside the blocks), then the name"""
+    m = re.match(r"blk\.(\d+)\.", name)
+    return (int(m.group(1)) if m else -1, name.encode())
+
+
+def imatrix_meta(path):
+    """the quantize.imatrix.* keys llama-quantize writes for a GGUF imatrix: (file, dataset, entries, chunks)"""
+    r = gguf.GGUFReader(path)
+    ds = r.fields["imatrix.datasets"].contents() if "imatrix.datasets" in r.fields else []
+    chunks = int(r.fields["imatrix.chunk_count"].contents()) if "imatrix.chunk_count" in r.fields else 0
+    entries = sum(1 for t in r.tensors if t.name.endswith(".in_sum2"))
+    return os.path.basename(path), (os.path.basename(ds[0]) if ds else None), entries, chunks
+
+
 def main() -> int:
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
@@ -318,6 +341,11 @@ def main() -> int:
     dense_dir = next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-dump=")), None)
     dense_max = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--dense-max-rows=")), 0))
     only_matched = "--only-matched" in flags
+    # --ftype=<llama-quantize type, e.g. Q8_0> writes the file exactly as llama-quantize does (its header
+    # keys, its tensor order); --header-only stops after the header (to check it against a llama-quantize file)
+    ftype_arg = next((a.split("=", 1)[1] for a in flags if a.startswith("--ftype=")), None)
+    llama_ftype = None if ftype_arg is None else (int(ftype_arg) if ftype_arg.isdigit() else LLAMA_FTYPE[ftype_arg.upper()])
+    header_only = "--header-only" in flags
     ldlq_cpu = "--ldlq-cpu" in flags
     ldlq_f64 = "--ldlq-f32" not in flags
     gpu_threads = int(next((a.split("=", 1)[1] for a in flags if a.startswith("--gpu-threads=")), min(threads, 4)))
@@ -473,10 +501,15 @@ def main() -> int:
         else:
             plan_w = plan
             kv_src = r
+        if llama_ftype is not None:   # (llama-quantize writes the tensors in its loader's order)
+            plan_w = sorted(plan_w, key=lambda p_: llama_order(p_[0].name))
         w = gguf.GGUFWriter(out, arch)
         for field in kv_src.fields.values():
             if field.name == gguf.Keys.General.ARCHITECTURE or field.name.startswith("GGUF."):
                 continue
+            if llama_ftype is not None and field.name in ("general.quantization_version", "general.file_type",
+                                                          "split.no", "split.count", "split.tensors.count"):
+                continue   # (llama-quantize: re-set at the end / removed)
             if only_matched and field.name.startswith("split."):
                 continue
             if field.name == gguf.Keys.General.ALIGNMENT:   # (keep the source's padding)
@@ -485,16 +518,35 @@ def main() -> int:
             val_type = field.types[0]
             sub_type = field.types[-1] if val_type == gguf.GGUFValueType.ARRAY else None
             w.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
+        if llama_ftype is not None:   # (gguf_set_val: remove, then append; then the imatrix keys as kv overrides)
+            w.add_uint32("general.quantization_version", GGML_QNT_VERSION)
+            w.add_uint32("general.file_type", llama_ftype)
+            if imat_path:
+                f_, ds_, ne_, nc_ = imatrix_meta(imat_path)
+                w.add_string("quantize.imatrix.file", f_[:127])
+                if ds_:
+                    w.add_string("quantize.imatrix.dataset", ds_[:127])
+                w.add_uint32("quantize.imatrix.entries_count", ne_)
+                if nc_ > 0:
+                    w.add_uint32("quantize.imatrix.chunks_count", nc_)
         for t, new_type, nbytes in plan_w:
             if new_type is not None:
                 ne1, ne2 = int(t.shape[1]), (int(t.shape[2]) if len(t.shape) == 3 else 1)
                 shape = (ne2, ne1, nbytes // (ne2 * ne1)) if len(t.shape) == 3 else (ne1, nbytes // ne1)
                 w.add_tensor_info(t.name, shape, np.uint8, nbytes, raw_dtype=new_type)
             else:
-                w.add_tensor_info(t.name, t.data.shape, t.data.dtype, t.data.nbytes, t.tensor_type)
+                shp = tuple(t.data.shape)
+                if llama_ftype is not None:   # (ggml_n_dims: trailing 1s of the ggml shape = leading 1s here dropped)
+                    while len(shp) > 1 and shp[0] == 1:
+                        shp = shp[1:]
+                w.add_tensor_info(t.name, shp, t.data.dtype, t.data.nbytes, t.tensor_type)
         w.write_header_to_file()
         w.write_kv_data_to_file()
         w.write_ti_data_to_file()
+        if header_only:
+            w.close()
+            print("  header only: %s" % out, flush=True)
+            continue
         t0 = time.time()
         for t, new_type, nbytes in plan_w:
             if new_type is None:
